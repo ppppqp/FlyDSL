@@ -119,6 +119,16 @@ def _create_mlir_context(*, load_dialects=True):
     return ctx
 
 
+_jit_context = threading.local()
+
+
+def _get_jit_mlir_context():
+    ctx = getattr(_jit_context, "value", None)
+    if ctx is None:
+        ctx = _jit_context.value = _create_mlir_context()
+    return ctx
+
+
 # Sentinel distinct from a real ``None`` snapshot value (a since-deleted global).
 _NOT_IN_BASELINE = object()
 
@@ -1470,7 +1480,7 @@ class JitFunction:
                 self._mem_cache[cache_key] = compiled_func
                 self._last_compiled = (cache_key, compiled_func)
             else:
-                with _create_mlir_context() as ctx, _hints_ctx:
+                with _get_jit_mlir_context() as ctx, _hints_ctx:
                     param_names, jit_args, dsl_types, constexpr_values = convert_to_jit_arguments(sig, bound)
                     # Per-call value/annotation consistency check.
                     for pname, dsl_type in zip(param_names, dsl_types):
