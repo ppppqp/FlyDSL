@@ -122,6 +122,7 @@ def make_layout_tv(thr_layout, val_layout):
     if not val_layout.is_static:
         raise ValueError("val_layout is not static")
 
+    # NOTE: layout_tv as a function: (thread id, value id) -> coordinate inside the block
     layout_mn = raked_product(thr_layout, val_layout)
     thr_size = size(thr_layout).to_py_value()
     val_size = size(val_layout).to_py_value()
