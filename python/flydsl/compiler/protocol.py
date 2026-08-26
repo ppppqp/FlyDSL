@@ -52,6 +52,9 @@ class Storable(Protocol):
 
 
 def get_ir_types(obj) -> List[ir.Type]:
+    """
+    NOTE: DSL -> MLIR types
+    """
     if isinstance(obj, ir.Value):
         return [obj.type]
     if hasattr(obj, "__get_ir_types__"):
@@ -78,8 +81,7 @@ def cache_signature(obj) -> object:
     if isinstance(obj, (tuple, list)):
         return tuple(cache_signature(x) for x in obj)
     raise TypeError(
-        f"Cannot derive cache signature for {obj!r}: type {type(obj).__name__} does not "
-        "implement __cache_signature__."
+        f"Cannot derive cache signature for {obj!r}: type {type(obj).__name__} does not implement __cache_signature__."
     )
 
 
@@ -95,6 +97,9 @@ def c_abi_spec(obj) -> List[Tuple[type, Callable]]:
 
 
 def extract_to_ir_values(obj) -> List[ir.Value]:
+    """
+    NOTE: DSL object -> one or more MLIR SSA values
+    """
     if isinstance(obj, ir.Value):
         return [obj]
     if hasattr(obj, "__extract_to_ir_values__"):
@@ -109,6 +114,10 @@ def extract_to_ir_values(obj) -> List[ir.Value]:
 
 
 def construct_from_ir_values(dsl_type, args, values: List[ir.Value]) -> DslType:
+    """
+    NOTE: gpu.func block arguments -> DSL object
+    """
+
     if isinstance(args, SimpleNamespace):
         rebuilt = {}
         cursor = 0

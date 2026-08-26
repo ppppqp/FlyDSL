@@ -23,6 +23,63 @@ from .protocol import construct_from_ir_values, extract_to_ir_values, get_ir_typ
 # =============================================================================
 
 
+"""
+@flyc.kernel
+def vector_add_kernel(A, B, C, tiled_copy):
+
+does this:
+@kernel invokes KernelFunction.__init__
+    ├── preserves original function
+    ├── AST-rewrites working function
+    ├── resolves annotations/signature
+    └── returns KernelFunction wrapper
+
+call to the kernel function finds curent CompilationContext and returns a KernelLauncher
+
+
+.launch(
+    grid=(grid_m, grid_n, 1),
+    block=(128, 1, 1),
+    stream=stream,
+)
+performs:
+KernelLauncher.launch
+    ├── normalizes grid/block
+    ├── infers known_block_size=[128,1,1]
+    ├── calls _emit_kernel
+    │   ├── creates gpu.func
+    │   ├── reconstructs DSL arguments
+    │   ├── executes vector_add_kernel while tracing
+    │   └── appends gpu.return
+    ├── returns to host-function insertion point
+    └── creates gpu.launch_func
+
+module attributes {gpu.container_module} {
+    gpu.module @kernels {
+        gpu.func @vector_add_kernel_0(...)
+            kernel
+            known_block_size = [128, 1, 1] {
+            // thread/block IDs
+            // flat_divide
+            // tiled-copy partitions
+            // predicated copies
+            // vector addition
+            gpu.return
+        }
+    }
+    func.func @vector_add(...) {
+      // calculate grid_m and grid_n
+
+      gpu.launch_func @kernels::@vector_add_kernel_0
+          blocks in (%grid_m, %grid_n, %c1)
+          threads in (%c128, %c1, %c1)
+          args(...)
+      return
+    }
+}
+"""
+
+
 def create_gpu_module(
     sym_name: str,
     targets: Optional[List[str]] = None,
@@ -31,6 +88,7 @@ def create_gpu_module(
     loc=None,
     ip=None,
 ) -> gpu.GPUModuleOp:
+    # NOTE: creates the container for GPU kernels. Return MLIR GPU module
     target_attrs = []
     if targets:
         for t in targets:
@@ -38,6 +96,7 @@ def create_gpu_module(
                 target_attrs.append(ir.Attribute.parse(t))
             else:
                 target_attrs.append(t)
+    # TODO: What is offloading handler?
     offloading = ir.Attribute.parse("#fly.explicit_module") if use_explicit_module else None
     module_op = gpu.GPUModuleOp(
         sym_name,
@@ -46,7 +105,7 @@ def create_gpu_module(
         loc=loc,
         ip=ip,
     )
-    module_op.regions[0].blocks.append()
+    module_op.regions[0].blocks.append()  # NOTE: creates the body block into which gpu.func op will later be inserted
     return module_op
 
 
@@ -62,6 +121,13 @@ def _validate_known_block_size(value):
     Raises:
         TypeError: if *value* is not a sequence of integers.
         ValueError: if the length is not 3 or any element is not positive.
+    """
+
+    """
+    NOTE: it requires:
+    - exactly three elements
+    - every element to be a python integer after unwrapping static DSL values
+    - every element to be positive
     """
     if value is None:
         return None
@@ -95,10 +161,13 @@ def create_gpu_func(
     loc=None,
     ip=None,
 ) -> gpu.GPUFuncOp:
+    """
+    NOTE: constructs the actual gpu.func
+    """
     return gpu.GPUFuncOp(
         function_type,
         sym_name=sym_name,
-        kernel=True,
+        kernel=True,  # NOTE: it marks the function as a GPU entry point rather than an ordinary device helper
         known_block_size=known_block_size,
         loc=loc,
         ip=ip,
@@ -106,6 +175,9 @@ def create_gpu_func(
 
 
 def _attach_attrs(op, unit_attrs: Optional[List[str]], value_attrs: Optional[Dict[str, Any]]) -> None:
+    # NOTE: this adds optional user-supplied attributes to either the kernel or launch operations
+    # extensibility mechanism for attaching backend or experimental metadata without changing decorator interface
+    # for each new attribute
     if unit_attrs:
         unit = ir.UnitAttr.get()
         for name in unit_attrs:
@@ -140,6 +212,12 @@ DimType = Union[int, ir.Value, Integer, Tuple[DimValueType, ...], List[DimValueT
 
 
 def _normalize_dim(dim: DimType) -> Tuple[DimValueType, DimValueType, DimValueType]:
+    # NOTE: normalize grid/block/cluster dimensions to a 3-tuple of (x, y, z)
+    # FlyDSL permits
+    # gird = 16
+    # gird = (16,)
+    # gird = (16, 8)
+    # gird = (16, 8, 4)
     if isinstance(dim, (int, ir.Value, Integer)):
         return (dim, 1, 1)
     elif len(dim) == 1:
@@ -172,6 +250,7 @@ class CompilationContext:
     - Location trackers for debugging
     """
 
+    # NOTE: This holds state shared by all kernels emitted while tracing one jit function
     _current = threading.local()
 
     # Thread-local storage for compile hints (waves_per_eu, maxnreg, etc.)
@@ -186,6 +265,15 @@ class CompilationContext:
             with CompilationContext.compile_hints({"waves_per_eu": 2}):
                 fn(*args, **kwargs)
         """
+        """
+        NOTE: example hints:
+        {
+            "waves_per_eu": 2,
+            "maxnreg": 64,
+            "fast_fp_math": True,
+        }
+        """
+
         prev = getattr(cls._compile_hints, "data", None)
         cls._compile_hints.data = merge_compile_hints(prev, hints)
         try:
@@ -266,6 +354,20 @@ class KernelLauncher:
 
     Created by calling a @kernel decorated function. Call .launch() to emit
     both the specialized gpu.func and its gpu.launch_func operation.
+
+
+
+    NOTE: e.g.
+    pending = vector_add_kernel(a, b, c) # creates a KernelLauncher with captured args
+    pending.launch(grid=(16, 1, 1), block=(256, 1, 1), smem=1024, stream=my_stream) # actually emits the kernel compilation
+
+    The pending object knows:
+    - which python kernel to trace
+    - which specialized arguments to use
+    - wihch active compilation owns it
+    - any attributes intended for the gpu.func
+
+    But it does not know launch configuration (grid/block/smem/stream) until launch() is called
     """
 
     def __init__(
@@ -292,10 +394,13 @@ class KernelLauncher:
 
     def _resolve_known_block_size(self, block_dims: Tuple) -> Optional[List[int]]:
         """Return an explicit block size or infer one from static launch dims."""
+
+        # NOTE: explicit is like @kernel(known_block_size=[128, 1, 1])
         explicit = self._kernel_function._known_block_size
         if explicit is not None:
             return _validate_known_block_size(explicit)
 
+        # NOTE: implicit is like kernel.launch(block=(x, y, z)) where x/y/z are static integers
         raw_dims = tuple(as_ir_value(value, keep_static=True) for value in block_dims)
         if all(isinstance(value, int) for value in raw_dims):
             return _validate_known_block_size(raw_dims)
@@ -355,8 +460,12 @@ class KernelLauncher:
         self._check_block_vs_known(block_dims, known_block_size)
 
         specialization_key = tuple(known_block_size) if known_block_size is not None else None
+
+        # NOTE: kernel is specialized by known_block_size
         emitted_kernel = self._emitted_kernels.get(specialization_key)
         if emitted_kernel is None:
+            # NOTE: traces the kernel body and creates its gpu.func
+
             kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
                 self._ctx,
                 self._args,
@@ -370,6 +479,8 @@ class KernelLauncher:
         else:
             kernel_name, kernel_args, smem_bytes = emitted_kernel
 
+        # NOTE: resolve dynamic shared memory size. If the kernel body used a dynamic SharedAllocator
+        # _emit_kernel reports its required byte count.
         if smem is None:
             smem = smem_bytes if smem_bytes is not None else 0
         elif smem_bytes is not None:
@@ -384,11 +495,15 @@ class KernelLauncher:
                     f"allocated by SharedAllocator in kernel '{kernel_name}'"
                 )
 
+        # NOTE: extract kernel arguments to IR values for gpu.launch_func
+        # The extracted IR values need to be aligned with the gpu.func signature
         kernel_operands = []
         for arg in kernel_args:
             kernel_operands.extend(extract_to_ir_values(arg))
 
+        # NOTE: convert grid and block dimensions to MLIR index values
         with launch_loc:
+            # NOTE: %c128 = arith.constant 128 : index
             grid_x = Index(grid_dims[0]).ir_value()
             grid_y = Index(grid_dims[1]).ir_value()
             grid_z = Index(grid_dims[2]).ir_value()
@@ -410,6 +525,8 @@ class KernelLauncher:
                     smem_val = arith.constant(ir.IntegerType.get_signless(32), smem_py)
 
             if stream is not None:
+                # NOTE: explicit launch stream
+                # TODO: what is a launch stream?
                 stream_val = as_ir_value(stream, keep_static=True)
             else:
                 ctx = CompilationContext.get_current()
@@ -420,6 +537,8 @@ class KernelLauncher:
             cluster_size = None
             if cluster is not None:
                 cx, cy, cz = _normalize_dim(cluster)
+                # NOTE: support GPU workgroup clustering
+                # used for cluster barriers and multicast operations on targets that support them
                 cluster_size = (
                     Index(cx).ir_value(),
                     Index(cy).ir_value(),
@@ -434,7 +553,7 @@ class KernelLauncher:
             }
             if cluster_size is not None:
                 launch_kwargs["cluster_size"] = cluster_size
-
+            # NOTE: emit gpu.launch_func
             launch_op = gpu.LaunchFuncOp(
                 ["kernels", kernel_name],
                 (grid_x, grid_y, grid_z),
@@ -456,6 +575,14 @@ class KernelFunction:
     Calling it captures the kernel arguments and returns a KernelLauncher.
     The launcher emits a specialized gpu.func together with its launch op once
     the launch configuration is known.
+
+    NOTE: represents a kernel definition before specialization.
+    @flyc.kernel
+    def vector_add_kernel(...):
+
+    is equivalent to
+    vector_add_kernel = KernelFunction(vector_add_kernel)
+    which uses ASTRewriter.transform to rewrite func.__code__
     """
 
     _current: Optional["KernelFunction"] = None
@@ -487,6 +614,7 @@ class KernelFunction:
         self._kernel_name: Optional[str] = None
         self._shared_allocator = None
 
+        # NOTE: resolves annotations such as A: fx.Tensor, tile: fx.Constexpr[int]
         full_sig = resolve_signature(self._func)
         params = list(full_sig.parameters.values())
 
@@ -526,6 +654,9 @@ class KernelFunction:
     ):
         """Emit gpu.func for this kernel into the GPU module."""
         sig = self._sig
+
+        # NOTE: resolves positional arguments, keyword arguments and default into a name-to-value mapping
+        # e.g. {"A": A, "B": B, "tile": 16}
         bound = sig.bind(*args, **kwargs)
         bound.apply_defaults()
 
@@ -597,6 +728,7 @@ class KernelFunction:
                         known_block_size=tuple(known_block_size) if known_block_size is not None else None,
                     ):
                         if bound_self is not None:
+                            # NOTE: execute the rewritten kernel body
                             self._func(bound_self, **dsl_args)
                         else:
                             self._func(**dsl_args)
