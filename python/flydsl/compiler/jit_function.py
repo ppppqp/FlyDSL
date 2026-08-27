@@ -60,6 +60,65 @@ EXTRA_SOURCE_DIRS: List[str] = []
 CacheInfo = namedtuple("CacheInfo", ["hits", "misses", "currsize", "disk_size"])
 
 
+"""
+NOTE:
+Life cycle:
+1. Call a @jit function
+2. Resolve argument specialization
+3. Build cache key
+4. find compiled artifact
+    5. Trace python into MLIR host function
+    6. Let kernel_function.py emit gpu.func + gpu.launch_func
+    7. Run backend compiler pipeline
+    8. Wrap compiled module in CompiledArtifact
+    9. Cache, pack arguments, execute
+
+
+
+    
+      JitFunction.__call__
+      │
+      ├── resolve signature and ROCm target
+      ├── check globals
+      ├── bind A/B/C/stream
+      ├── derive specialization key
+      ├── miss CallState cache
+      ├── miss in-memory artifact cache
+      ├── miss disk cache
+      ├── acquire cross-process compile lock
+      │
+      ├── create MLIR Context
+      ├── convert PyTorch values to JitArguments
+      ├── create top-level module
+      ├── create gpu.module @kernels
+      ├── create func.func @vector_add
+      ├── enter CompilationContext
+      ├── reconstruct fx.Tensor/fx.Stream values
+      │
+      ├── execute transformed vector_add
+      │     ├── construct tiled-copy layout
+      │     ├── compute grid dimensions
+      │     └── vector_add_kernel(...).launch(...)
+      │           ├── emit gpu.func
+      ├── add func.return
+      ├── run MlirCompiler.compile
+      ├── construct CompiledArtifact
+      ├── store memory/disk cache entries
+      ├── release compile lock
+      ├── initialize/get ExecutionEngine function
+      ├── build CallState
+      └── pack arguments and execute
+
+
+  For a matching later call:
+
+  JitFunction.__call__
+      ├── bind and derive cache key
+      ├── find CallState
+      └── update ABI slots and execute
+"""
+
+
 class FileLock:
     """fcntl-based file lock supporting shared and exclusive modes."""
 
@@ -788,6 +847,9 @@ class MlirCompiler:
         backend = get_backend(arch=arch)
 
         compile_hints = CompilationContext.get_compile_hints()
+
+        # NOTE: rather than mutate the originally constructed Python module directly, serialize and reparse it
+        # TODO: maybe avoid this for better performance?
         module = ir.Module.parse(module.operation.get_asm(enable_debug_info=env.debug.enable_debug_info))
         backend.lower_compile_hints(module, compile_hints=compile_hints)
         cfg = _pipeline_fragments_for_mode(backend, compile_hints=compile_hints)
@@ -821,6 +883,8 @@ class MlirCompiler:
 
         with _llvm_ctx:
             if dump_enabled:
+                # NOTE: IR dumping mode
+                # intentionally run each stage of the pipeline separately so we can dump the MLIR after each stage
                 asm = module.operation.get_asm(enable_debug_info=True)
                 kernel_names = _infer_kernel_names_from_asm(asm)
                 subdir = kernel_names[0] if len(kernel_names) == 1 else (func_name or "module")
@@ -898,6 +962,7 @@ class MlirCompiler:
                     else:
                         print("[flydsl.compile] ISA dump skipped (external LLVM mode)")
             else:
+                # NOTE: normal path
                 if external_binary:
                     from .external_llvm import run_external_binary_codegen
 
@@ -1148,6 +1213,7 @@ class JitFunction:
         self._original_func.__kwdefaults__ = func.__kwdefaults__
         self._original_func.__qualname__ = func.__qualname__
         self._original_func.__module__ = func.__module__
+        # NOTE: also rewrite here
         self.func = ASTRewriter.transform(func)
         self.compile_hints = dict(compile_hints) if compile_hints is not None else {}
         self.manager_key = None
@@ -1357,6 +1423,19 @@ class JitFunction:
         return str(cache_key)
 
     def __call__(self, *args, **kwargs):
+        # NOTE: handles one @jit function called from another while MLIR tracing is already active.
+        # FlyDSL does not construct another cache key/execution engine
+        # directly executes the transformed function
+        """
+        e.g.
+        @jit
+        def helper():
+
+        @jit
+        def outer():
+            helper()  # called while MLIR tracing is active
+
+        """
         if ir.Context.current is not None:
             return self.func(*args, **kwargs)
 
@@ -1383,6 +1462,8 @@ class JitFunction:
 
         # Resolve once so cache identity and compilation use the same options.
         effective_hints = self._effective_compile_hints()
+
+        # TODO: what's the difference with cache manager?
         cache_key = self._build_full_cache_key(
             bound.arguments,
             owner_cls=owner_cls,
@@ -1488,11 +1569,15 @@ class JitFunction:
                     log().info(f"jit_args={jit_args}")
                     log().info(f"dsl_types={dsl_types}")
 
+                    # NOTE: create a top level mlir module
+                    # contains a host launcher function and a nested gpu module for device kernels
                     module = ir.Module.create(loc=loc)
                     module.operation.attributes["gpu.container_module"] = ir.UnitAttr.get()
 
                     with ir.InsertionPoint(module.body), loc:
                         backend = get_backend()
+
+                        # NOTE: create gpu modules with backend targets as attributes
                         gpu_module = create_gpu_module("kernels", targets=backend.gpu_module_targets())
 
                         func_op = func.FuncOp(self.func.__name__, (ir_types, []))
@@ -1517,6 +1602,7 @@ class JitFunction:
                                     self.func,
                                     fastmath=effective_fastmath_hint(CompilationContext.get_compile_hints()),
                                 ):
+                                    # NOTE: enter the context, call the kernel function for tracing
                                     if bound_self is not None:
                                         self.func(bound_self, **named_args)
                                     else:
@@ -1544,6 +1630,9 @@ class JitFunction:
                         # Also clear targets set at construction: the backend attach-target
                         # pass is the sole source when link_libs is used; duplicating
                         # targets can make the runtime pick an object without extern libs.
+
+                        # NOTE: external functions may add comp_ctx.link_libs and comp_ctx.post_load_processors
+                        # If present, the JIT path marks the module as explicitly loaded
                         gpu_module.offloadingHandler = ir.Attribute.parse("#fly.explicit_module")
                         if "targets" in gpu_module.operation.attributes:
                             del gpu_module.operation.attributes["targets"]
@@ -1555,6 +1644,7 @@ class JitFunction:
                         link_libs=link_libs,
                     )
 
+                    # NOTE: it owns the compiled MLIR module, execution engine, loaded GPU code objects, etc.
                     compiled_func = CompiledArtifact(
                         compiled_module,
                         self.func.__name__,
