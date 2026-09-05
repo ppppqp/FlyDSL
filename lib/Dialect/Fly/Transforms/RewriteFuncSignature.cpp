@@ -1,6 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 FlyDSL Project Contributors
 
+/*
+Why do we need this pass?
+
+A type such as !fly.layout<(16, ?):(1, ?)> is meaning to the Fly compiler, but LLVM do not know how
+to pass a "fly layout". Before reaching LLVM, the compiler must answer "what concrete runtime bits
+represent this value?"
+For this layout, the answer is just the two dynamic integers. The static 16 and 1 already exist in
+the type and require no runtime storage.
+An MLIR type is not automatically an ABI. For example, we need IntTupe <> packed integer struct for
+boundary representation.
+
+Why not keep Fly types until convert-fly-to-rocdl?
+
+It's possible, but it would require handling much more than function arguments. A fly value can
+cross func.func, func.call, func.return, gpu..., scf... and all participants must change together.
+So just using dialect conversion here.
+
+
+Packing separates the compile-time structure from runtime payload.
+
+
+Why pack at SCF boundaries too? Because an scf.if result or scf.for loop-carried value is also an
+SSA boundary with a declared type.
+*/
+
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Func/Transforms/FuncConversions.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
@@ -26,10 +51,20 @@ namespace fly {
 
 namespace {
 
+/*
+NOTE:
+Consider:
+!fly.int_tuple<(?, 8, (?, 4))>
+Its static leaves are 8 and 4
+Only two dynamic values need to cross the boundary. The pass recursively collects them.
+
+*/
 void collectDynamicLeaves(IntTupleAttr attr, SmallVectorImpl<IntAttr> &leaves) {
   if (attr.isLeaf()) {
+    // NOTE: Leaf means it is either a static int or a dynamic int.
     auto intAttr = attr.extractIntFromLeaf();
     if (!intAttr.isStatic())
+      // NOTE: collect if not static
       leaves.push_back(intAttr);
   } else {
     for (int i = 0; i < attr.rank(); ++i)
@@ -52,6 +87,12 @@ bool isStaticNarrowLayout(Attribute attr) {
 // Fully static sub-components are omitted from the struct.
 //===----------------------------------------------------------------------===//
 
+/*
+NOTE:
+builds a packed LLVM struct, so !fly.int_tuple<(?, 8, (?, 4))> becomes {i32, i32} (the two dynamic
+leaves). The static values remain encoded in the original Fly type used when reconstructing the
+value.
+*/
 LLVM::LLVMStructType getIntTupleStructType(MLIRContext *ctx, IntTupleAttr attr) {
   SmallVector<IntAttr> leaves;
   collectDynamicLeaves(attr, leaves);
@@ -62,6 +103,19 @@ LLVM::LLVMStructType getIntTupleStructType(MLIRContext *ctx, IntTupleAttr attr) 
   return LLVM::LLVMStructType::getLiteral(ctx, fields, true);
 }
 
+/*
+NOTE:
+A Fly layout consists of shape and stride
+The carrier includes only whichever pieces have dynamic leaves
+For example:
+!fly.layout<(16, ?):(1, ?)> becomes
+  !llvm.struct<packed (
+      struct<packed (i32)>,
+      struct<packed (i32)>
+  )>
+The nested structs preserves the hierarchical role of those values.
+If only the stride is dynamic, the carrier is !llvm.struct<packed (struct<packed (i32))>>
+*/
 LLVM::LLVMStructType getLayoutStructType(MLIRContext *ctx, LayoutAttr attr) {
   SmallVector<Type> fields;
   if (!attr.getShape().isStatic())
@@ -74,6 +128,20 @@ LLVM::LLVMStructType getLayoutStructType(MLIRContext *ctx, LayoutAttr attr) {
 LLVM::LLVMStructType getNarrowLayoutStructType(MLIRContext *ctx, Attribute attr);
 LLVM::LLVMStructType getComposedInnerStructType(MLIRContext *ctx, Attribute attr);
 
+/*
+NOTE:
+A composed layout contains:
+- inner transformation
+- offset
+- outer layout
+
+The carrier fields are added only for dynamic components.
+The pass recursively supports nested composed layouts.
+A static swizzle is not serialized. It can be reconstructed from its type:
+inner = StaticOp::create(builder, loc, innerTy);
+A dynamic nested layout is packed recursively. This preserves complex layouts across control-flow
+boundaries without carrying redundant compile-time information.
+*/
 LLVM::LLVMStructType getComposedLayoutStructType(MLIRContext *ctx, ComposedLayoutAttr attr) {
   SmallVector<Type> fields;
   if (!attr.isStaticOuter())
@@ -81,6 +149,7 @@ LLVM::LLVMStructType getComposedLayoutStructType(MLIRContext *ctx, ComposedLayou
   if (!attr.isStaticOffset())
     fields.push_back(getIntTupleStructType(ctx, attr.getOffset()));
   if (!attr.isStaticInner())
+    // NOTE: The inner can also be a nested composed layout, so we recursively pack it.
     fields.push_back(getComposedInnerStructType(ctx, attr.getInner()));
   return LLVM::LLVMStructType::getLiteral(ctx, fields, true);
 }
@@ -102,6 +171,10 @@ LLVM::LLVMStructType getNarrowLayoutStructType(MLIRContext *ctx, Attribute attr)
   llvm_unreachable("unexpected layout attribute type");
 }
 
+/*
+NOTE:
+A coordinate tensor contains base coordinate and layout
+*/
 LLVM::LLVMStructType getCoordTensorStructType(MLIRContext *ctx, CoordTensorType ty) {
   SmallVector<Type> fields;
   if (!ty.getBase().isStatic())
@@ -147,6 +220,17 @@ Value packIntTupleToStruct(OpBuilder &builder, Location loc, Value intTuple, Int
   return result;
 }
 
+/*
+NOTE:
+At function entry, the pass extracts the dynamic fields and builds:
+%shape = fly.make_int_tuple ...
+%stride = fly.make_int_tuple ...
+%layout = fly.make_layout %shape, %stride
+
+Static shape or stride components are rebuilt using an empty make_int_tuple whose result type
+contains the static values: %shape = fly.make_int_tuple() : !fly.int_tuple<(16)>
+*/
+
 Value packLayoutToStruct(OpBuilder &builder, Location loc, Value layout, LayoutAttr attr,
                          LLVM::LLVMStructType structTy) {
   Value result = LLVM::UndefOp::create(builder, loc, structTy);
@@ -174,6 +258,9 @@ Value packComposedInnerToStruct(OpBuilder &builder, Location loc, Value inner, A
 Value packNarrowLayoutToStruct(OpBuilder &builder, Location loc, Value layout, Attribute attr,
                                LLVM::LLVMStructType structTy);
 
+/*
+
+ */
 Value packComposedLayoutToStruct(OpBuilder &builder, Location loc, Value composed,
                                  ComposedLayoutAttr attr, LLVM::LLVMStructType structTy) {
   Value result = LLVM::UndefOp::create(builder, loc, structTy);
@@ -245,12 +332,25 @@ Value packCoordTensorToStruct(OpBuilder &builder, Location loc, Value operand, C
   return result;
 }
 
+/*
+NOTE:
+A fly memref is conceptually:
+MemRef = (pointer, layout)
+For !fly.memref<f32, global, 32:1>, the layout is completely static, therefore only the pointer must
+cross the boundary. It is packed as a single !fly.ptr carrier.
+For !fly.memref<f32, global, (?, 32):1>, the layout is dynamic, so it is packed as
+  !llvm.struct<packed (
+      !fly.ptr,
+      !llvm.struct<packed (i32)>
+  )>
+*/
 std::pair<Value, Value> packMemRefToPtrAndLayout(OpBuilder &builder, Location loc, Value operand,
                                                  fly::MemRefType memrefTy) {
   Value ptrValue = GetIterOp::create(builder, loc, operand);
   Value layoutValue = GetLayoutOp::create(builder, loc, operand);
 
   if (!memrefHasDynamicLayout(memrefTy))
+    // NOTE: if the layout is static, only pack ptr
     return {ptrValue, Value()};
 
   auto layoutStructTy = getNarrowLayoutStructType(memrefTy.getContext(), memrefTy.getLayout());
@@ -493,6 +593,17 @@ public:
       return success();
     });
 
+    /*
+    NOTE: A Fly type often stores static information: !fly.int_tuple<(4, 8)>
+    Suppose a function originally has
+    func.func @foo(
+      %tile: !fly.int_tuple<(4, 8)>,
+    )
+    The argument carries no runtime information. Therefore this pass converts it to:
+    func.func @foo()
+    If the body needs %tile,the pass reconstructs it:
+    %tile = fly.static : !fly.int_tuple<(4, 8)>
+    */
     addConversion(
         [](MayStaticTypeInterface ty, SmallVectorImpl<Type> &out) -> std::optional<LogicalResult> {
           if (!ty.isStatic())
@@ -503,8 +614,22 @@ public:
 
     // Source materialization: carriers -> reconstruct an old-typed DSL value
     // for any remaining uses (function entries, scf body entries, etc.).
+
+    /*
+    NOTE:
+    At function or region entry:
+    %shapeMetadata = llvm.extractvalue ...
+    %strideMetadata = llvm.extractvalue ...
+    %shape = fly.make_int_tuple ...
+    %stride = fly.make_int_tuple ...
+    %layout = fly.make_layout %shape, %stride
+    %memref = fly.make_view %ptr, %layout
+
+    Downstream passes continue seeing a normal-form memref produced by fly.make_view
+    */
     addSourceMaterialization(
         [](OpBuilder &b, Type oldType, ValueRange carriers, Location loc) -> Value {
+          // NOTE: unpack at function or region entry
           if (carriers.empty()) {
             // 1:0 (static DSL was sunk) - rebuild a `fly.static` value so
             // downstream patterns keep seeing the normal-form sentinel.
@@ -531,8 +656,14 @@ public:
     // Target materialization: an old-typed DSL value -> carrier(s) for the
     // new boundary representation. Called at scf yields, launch_func operands,
     // etc.
+
+    /*
+    NOTE:
+    At call or launch site, use fly.get_layout or fly.get_iter and pack into a struct if dynamic.
+    */
     addTargetMaterialization([](OpBuilder &b, TypeRange newTypes, ValueRange oldValues,
                                 Location loc, Type) -> SmallVector<Value> {
+      // NOTE: pack at a call or launch site
       if (newTypes.empty())
         return {};
       assert(oldValues.size() == 1 && "DSL boundary materialization expects a single source");
@@ -562,6 +693,8 @@ public:
     for (ValueRange carriers : adaptor.getKernelOperands())
       kernelOperands.append(carriers.begin(), carriers.end());
 
+    // NOTE: use rewriter to modify the kernel operands in place, since the number of operands may
+    // change due to the type conversion
     rewriter.modifyOpInPlace(op, [&] { op.getKernelOperandsMutable().assign(kernelOperands); });
     return success();
   }
@@ -583,8 +716,17 @@ public:
     RewritePatternSet patterns(ctx);
     ConversionTarget target(*ctx);
 
+    // NOTE: install the standard function signature conversion patterns for func.func, func.return,
+    // and func.call
     populateFunctionOpInterfaceTypeConversionPattern<func::FuncOp>(patterns, typeConverter);
     populateFunctionOpInterfaceTypeConversionPattern<gpu::GPUFuncOp>(patterns, typeConverter);
+
+    /*
+    NOTE: we also need to convert the return because originally
+    func.func @callee() -> !fly.memref<f32, global, (?, 32):1>
+    But we need
+    func.func @callee() -> (!fly.ptr, !llvm.struct<packed (i32)>)
+    */
     populateReturnOpTypeConversionPattern(patterns, typeConverter);
     populateCallOpTypeConversionPattern(patterns, typeConverter);
 
@@ -611,8 +753,25 @@ public:
     });
 
     // scf.{for,if,while} + scf.yield + scf.condition signature handling.
+    /*
+    NOTE: we also convert for scf.{for,if,while} because region boundaries behave like function
+    boundaries.
+    */
     scf::populateSCFStructuralTypeConversionsAndLegality(typeConverter, patterns, target);
 
+    /*
+    NOTE:
+    Since kernel type can change, we need to rewrite the launch_func operands to match the new
+    kernel signature.
+
+    Before: gpu.launch_func @kernels::@kernel args(%memref : !fly.memref<...>)
+    After:
+    gpu.launch_func @kernels::@kernel
+        args(
+          %ptr : !fly.ptr<...>,
+          %layout_metadata : !llvm.struct<packed (...)>
+        )
+    */
     patterns.add<RewriteLaunchFuncOperands>(typeConverter, ctx);
 
     if (failed(applyPartialConversion(getOperation(), target, std::move(patterns))))
