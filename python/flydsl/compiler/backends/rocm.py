@@ -7,6 +7,24 @@ from ...runtime.device import get_rocm_arch, get_warp_size
 from ...utils import env
 from .base import BaseBackend, GPUTarget
 
+"""
+NOTE:
+  jit_function.py
+      │
+      ├── get_backend()
+      │     └── RocmBackend(target)
+      │
+      ├── create_gpu_module(
+      │       targets=backend.gpu_module_targets()
+      │   )
+      │
+      └── MlirCompiler.compile()
+            ├── backend.lower_compile_hints(module)
+            ├── backend.pipeline_fragments()
+            └── PassManager.run(...)
+
+"""
+
 
 class RocmBackend(BaseBackend):
     """ROCm / AMDGPU compile backend (HIP runtime, ROCDL lowering)."""
@@ -50,8 +68,14 @@ class RocmBackend(BaseBackend):
     def _pipeline_parts(self, *, compile_hints: dict) -> Tuple[List[str], str]:
         chip = self.target.arch
         waves_per_eu = compile_hints.get("waves_per_eu")
-        maxnreg = compile_hints.get("maxnreg")
+        # NOTE: controls the intended wave occupancy per execution unit
+        # a larger number generally asks the compiler to leave enough register resources for more resident waves
 
+        maxnreg = compile_hints.get("maxnreg")
+        # NOTE: constraints the number of vector registers allocatred to each kernel
+        # lowering it may improve occupancy at the cost of more register spilling and slower code
+
+        # TODO: maybe more hints here?
         bin_cli_opts = []
         if env.debug.enable_debug_info:
             bin_cli_opts.append("-g")
@@ -61,40 +85,46 @@ class RocmBackend(BaseBackend):
             bin_cli_opts.append(f"--amdgpu-num-vgpr={maxnreg}")
 
         rocdl_opts = {
+            # NOTE: optimization level
             "O": 2,
+            # NOTE: configured AMDGPU target ABI version
             "abi": 600,
             "chip": chip,
+            # NOTE: floating point behavior
             "correct-sqrt": "true",
             "daz": "false",
+            # NOTE: fast math mode
             "fast": "true" if compile_hints.get("fast_fp_math") else "false",
             "features": "",
             "finite-only": "false",
             "module": "",
+            # NOTE: identifies AMD GCN targeting the AMD HSA environment
             "triple": "amdgcn-amd-amdhsa",
             "unsafe-math": "true" if compile_hints.get("unsafe_fp_math") else "false",
             "wave64": "true" if get_warp_size(chip) == 64 else "false",
         }
 
         pre_binary_fragments = [
-            "fly-rewrite-func-signature",
-            "fly-canonicalize",
-            "fly-layout-lowering",
-            "fly-int-swizzle-simplify",
-            "canonicalize",
-            "fly-convert-atom-call-to-ssa-form",
-            "fly-promote-regmem-to-vectorssa",
-            "convert-fly-to-rocdl",
+            "fly-rewrite-func-signature",  # NOTE: rewrites high level fly types at function and control-flow boundarries, like fly.layout, fly.memref
+            "fly-canonicalize",  # NOTE: performs simplification
+            "fly-layout-lowering",  # NOTE: lowers layout algebra into concrete computations
+            "fly-int-swizzle-simplify",  # NOTE: recognizes and simplifies specific arithmetic forms produced by FlyDSL swizzle lowering
+            "canonicalize",  # NOTE: mlir's standard canonicalization
+            "fly-convert-atom-call-to-ssa-form",  # NOTE: copy and mma op can initially operate on register-memory-like fragments. This
+            # pass converts them to SSA form, which is required for the next pass
+            "fly-promote-regmem-to-vectorssa",  # NOTE: replaces logical register-memory objects with vector SSA values
+            "convert-fly-to-rocdl",  # NOTE: target conversion
             "canonicalize",
             f"gpu.module(convert-scf-to-cf,cse,"
             f"convert-rocdl-fastmath-ops,"
             f"convert-gpu-to-rocdl{{chipset={chip} index-bitwidth=0 runtime=HIP use-bare-ptr-memref-call-conv=true}},"
-            f"fly-rocdl-cluster-attr)",
+            f"fly-rocdl-cluster-attr)",  # NOTE: FlyDSL support workgroup cluster dimension.
         ]
         binary_prep_fragments = [
             f"rocdl-attach-target{{{self._format_pass_opts(rocdl_opts)}}}",
-            "convert-scf-to-cf",
+            "convert-scf-to-cf",  # NOTE: lower for host launcher (the jit wrapper)
             "convert-cf-to-llvm",
-            "gpu-to-llvm{use-bare-pointers-for-host=true use-bare-pointers-for-kernels=true}",
+            "gpu-to-llvm{use-bare-pointers-for-host=true use-bare-pointers-for-kernels=true}",  # NOTE: lowers gpu.launch_func
             "convert-vector-to-llvm",
             "convert-arith-to-llvm",
             "convert-func-to-llvm",
