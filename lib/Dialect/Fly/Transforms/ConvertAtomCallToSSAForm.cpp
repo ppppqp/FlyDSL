@@ -1,6 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2025 FlyDSL Project Contributors
 
+/*
+The purpose of this pass is to begin replacing the fiction of "memory in registers" with actual SSA
+values.
+The pass is deliberately transitional: it inserts explicit loads and stores around atom calls.
+fly-promote-regmem-to-vectorssa pass removes the register-memory objects more globally.
+
+Why this pass is necessary:
+After layout lowering, a thread-local fragment may still look like memory:
+%reg_ptr = fly.make_ptr() : !fly.ptr<f16, register>
+%reg_view = fly.make_view(%reg_ptr, %layout) : (...) -> !fly.memref<f16, register, 4:1>
+fly.copy_atom_call(%atom, %src, %reg_view)
+
+But physical GPU registers are naturally represented in compiler IR as SSA values:
+%values = ... : vector<4xf16>
+
+copy_atom_call accept memref -> copy_atom_call_ssa accept value directly
+
+
+*/
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -24,6 +43,10 @@ namespace fly {
 namespace {
 
 bool isEligibleToPromote(fly::MemRefType memRefTy) {
+  /* NOTE:
+  Deciding which register fragments are eligible
+  */
+  // NOTE: only promote register memory
   if (!isGenericAddressSpace<AddressSpace::Register>(memRefTy.getAddressSpace()))
     return false;
   auto layoutAttr = dyn_cast<LayoutAttr>(memRefTy.getLayout());
@@ -31,6 +54,8 @@ bool isEligibleToPromote(fly::MemRefType memRefTy) {
     return false;
   LayoutBuilder<LayoutAttr> builder(memRefTy.getContext());
   auto coalesced = layoutCoalesce(builder, layoutAttr);
+
+  // NOTE: only promote register memory with a continuous linear layout
   if (!coalesced.isLeaf())
     return false;
   return coalesced.getStride().isLeafStaticValue(1) || coalesced.getShape().isLeafStaticValue(1);
@@ -48,6 +73,7 @@ public:
     SmallVector<CopyAtomCall> copyOpsToConvert;
     SmallVector<MmaAtomCall> mmaOpsToConvert;
 
+    // NOTE: collect all copy_atom_call and mma_atom_call that are eligible to promote to SSA form
     moduleOp->walk([&](CopyAtomCall op) {
       auto srcTy = cast<fly::MemRefType>(op.getSrc().getType());
       auto dstTy = cast<fly::MemRefType>(op.getDst().getType());
@@ -78,6 +104,13 @@ public:
 
       Value srcVal = copyOp.getSrc();
       if (srcEligible) {
+        /*
+        NOTE:
+        fly.copy_atom_call(%atom, %register_view, %global_view)
+        becomes
+        %src_vector = fly.ptr.load(%register_ptr) : !fly.ptr<f16, register> -> vector<4xf16>
+        fly.copy_atom_call_ssa(%atom, %src_vector, %global_view)
+        */
         Value srcIter = srcVal.getDefiningOp<MakeViewOp>().getIter();
         srcVal = PtrLoadOp::create(builder, loc, RegMem2SSAType(srcTy, true), srcIter);
       }
