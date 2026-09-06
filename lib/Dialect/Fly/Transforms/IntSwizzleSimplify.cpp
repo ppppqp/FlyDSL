@@ -1,6 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2025 FlyDSL Project Contributors
 
+/*
+NOTE:
+It is a narrow algebraic optimization that cleans up address arithmetic generated
+when swizzled shared-memory layouts are lowered.
+
+Layout lowering expresses a swizzle with integer operations:
+masked = x & mask
+shifted = masked >> shift
+result = x ^ shifted
+
+in MLIR:
+%a = arith.andi %x, %mask
+%h = arith.shrui %a, %shift
+%r = arith.xori %x, %h
+
+But %x may include a large aligned offset, e.g. x = base + offset
+When offset is a multiple of the swizzle period, it does not participate in the swizzle. Therefore:
+swizzle(base + offset) can be rewritten as swizzle(base) + offset.
+
+Suppose mask = 0b00110000, and shift = 4,
+Then it's basically x[1:0] = x[1:0] ^ x[5:4], which means bits higher than 6 does not affect the
+swizzle result. Therefore, the swizzle period is 2^6 = 64.
+
+Suppose offset = 128, then swizzle(base + 128) = swizzle(base) + 128.
+Because base + 128 has the same bits [5:0] as base, so the swizzle result is the same.
+*/
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
@@ -40,6 +66,7 @@ public:
 
 private:
   static int satMul(int a, int b) {
+    // NOTE: saturating multiply to avoid overflow
     if (a == 0 || b == 0)
       return 0;
     return (a > INT32_MAX / b) ? INT32_MAX : a * b;
@@ -53,15 +80,23 @@ private:
   llvm::SmallPtrSet<Value, 16> visiting;
 };
 
+/*
+  NOTE:
+*/
 int Divisibility::get(Value v) {
+
   if (auto c = getConstantIntValue(v)) {
+    // NOTE: a constant 1024 is divisible by 1024, so its divisibility is 1024.
     int64_t abs_c = *c == INT64_MIN ? INT64_MAX : std::abs(*c);
+    // NOTE: Zero is treated as divisible by any integer
     return abs_c == 0 ? INT32_MAX : (int)std::min(abs_c, (int64_t)INT32_MAX);
   }
   if (auto it = cache.find(v); it != cache.end())
     return it->second;
   if (!visiting.insert(v).second)
     return 1; // conservative on cycles
+  // NOTE: look backward at how a value was computed (fromDef)
+  // look forward at users of an SSA value (fromUses)
   int d = std::max(fromDef(v), fromUses(v));
   visiting.erase(v);
   return cache[v] = d;
@@ -72,13 +107,17 @@ int Divisibility::fromDef(Value v) {
   if (!def)
     return 1;
   return llvm::TypeSwitch<Operation *, int>(def)
+      // NOTE: divisible(a + b) >= gcd(divisible(a), divisible(b))
       .Case<arith::AddIOp>([&](auto op) { return std::gcd(get(op.getLhs()), get(op.getRhs())); })
+      // NOTE: divisible(a * b) >= satMul(divisible(a), divisible(b))
       .Case<arith::MulIOp>([&](auto op) { return satMul(get(op.getLhs()), get(op.getRhs())); })
+      // NOTE: divisible(a << k) >= satMul(divisible(a), 1 << k)
       .Case<arith::ShLIOp>([&](auto op) {
         int lhs = get(op.getLhs());
         auto k = getConstantIntValue(op.getRhs());
         return (k && *k >= 0 && *k < 31) ? satMul(lhs, 1 << *k) : lhs;
       })
+      // NOTE: divisible(select(a, b, c)) >= gcd(divisible(b), divisible(c))
       .Case<arith::SelectOp>(
           [&](auto op) { return std::gcd(get(op.getTrueValue()), get(op.getFalseValue())); })
       .Default(1);
@@ -92,6 +131,12 @@ int Divisibility::fromUses(Value v) {
 }
 
 int Divisibility::fromMakeOpUser(Operation *user, unsigned operandIdx) {
+  /*
+  NOTE:
+  if %x is inserted into fly.make_int_tuple(%x)
+  the result's IntTupleType tells the compiler which dynamic tuple leaf corresponds to %x and what
+  its divisibility is.
+  */
   auto resTy = llvm::TypeSwitch<Operation *, IntTupleType>(user)
                    .Case<MakeIntTupleOp, MakeShapeOp, MakeStrideOp, MakeCoordOp>(
                        [](auto op) { return cast<IntTupleType>(op.getType()); })
@@ -102,6 +147,7 @@ int Divisibility::fromMakeOpUser(Operation *user, unsigned operandIdx) {
   // DFS the IntTupleAttr to find the operandIdx-th dynamic leaf.
   unsigned cursor = 0;
   int result = 1;
+  // NOTE: walks the tuple type recursively to find the operandIdx-th dynamic leaf.
   std::function<bool(IntTupleAttr)> visit = [&](IntTupleAttr a) -> bool {
     if (a.isLeaf()) {
       auto leaf = a.extractIntFromLeaf();
@@ -134,16 +180,32 @@ int Divisibility::fromMakeOpUser(Operation *user, unsigned operandIdx) {
 // when each aᵢ ≡ 0 (mod period).  When `base` drops out entirely the swizzle of 0 folds to 0.
 //===------------------------------------------------------------------------------------------===//
 
+/*
+NOTE:
+suppose the input is
+((x + d1) + d2)
+and both d1 and d2 are divisible by swizzle period. The result becomes:
+base = x
+offsets = [d1, d2]
+
+*/
 struct PeelResult {
   Value base;
   SmallVector<Value> offsets;
 };
 
 PeelResult peelByPeriod(Value v, int period, Divisibility &div) {
+
+  /*
+  NOTE: for an SSA value %v, it computes a conservative integer d meaning:
+  %v is known to be divisible by d.
+  For example, divisibility(%x * 512) = at least 512
+  Main query: Divisibility::get(%v)
+  */
   if (period <= 0)
     return {v, {}};
   auto period_multiple = [&](Value x) { return div.get(x) % period == 0; };
-
+  // NOTE: on either side of an addition.
   if (auto add = v.getDefiningOp<arith::AddIOp>()) {
     if (period_multiple(add.getRhs())) {
       auto rec = peelByPeriod(add.getLhs(), period, div);
@@ -155,6 +217,8 @@ PeelResult peelByPeriod(Value v, int period, Divisibility &div) {
       rec.offsets.push_back(add.getLhs());
       return rec;
     }
+    // NOTE: if neither side is divisible by period, then the whole addition is not divisible by
+    // period, so we cannot peel anything out.
     return {v, {}};
   }
   if (period_multiple(v))
@@ -183,14 +247,38 @@ public:
     // Collect candidate xori ops (with their period) up-front so we can rewrite
     // without invalidating the walk.
     SmallVector<std::pair<arith::XOrIOp, int>> candidates;
-
+    /*
+    NOTE:
+    For each GPU function, it:
+    1. Finds arithmetic expressions that look exactly like Fly's swizzle formula.
+    2. Computes the swizzle period
+    3. Determines whether input terms are divisible by that period
+    4. Pulls divisible terms outside the swizzle.
+    */
     fn.walk([&](arith::XOrIOp xori) {
+      /*
+        NOTE:
+        %a = arith.andi %x, %mask
+        %h = arith.shrui %a, %shift
+        %r = arith.xori %x, %h
+
+                xori
+               /    \
+              x     shrui
+                    /    \
+                  andi   shift
+                 /    \
+                x     mask
+      */
+      // NOTE: assume shrui
       auto shrui = xori.getRhs().getDefiningOp<arith::ShRUIOp>();
       if (!shrui)
         return;
+      // NOTE: check if the lhs of shrui is an andi
       auto andi = shrui.getLhs().getDefiningOp<arith::AndIOp>();
       if (!andi)
         return;
+      // NOTE: get x
       Value x = xori.getLhs();
       if (andi.getLhs() != x)
         return;
@@ -201,10 +289,12 @@ public:
       uint64_t mask = (uint64_t)*maskC;
       if (mask == 0)
         return;
+      // NOTE: check if mask is a contiguous bitmask, e.g. 0b00111100
       uint64_t low = mask & -mask;
       uint64_t plus = mask + low;
       if ((mask & plus) != 0)
         return;
+      // NOTE: k is the position of the lowest set bit in mask, M is the number of set bits in mask
       int K = llvm::countr_zero(mask);
       int M = llvm::popcount(mask);
       if ((int)*shiftC > K)
@@ -213,6 +303,7 @@ public:
     });
 
     for (auto [xori, period] : candidates) {
+      // NOTE: input = x
       Value input = xori.getLhs();
       auto peeled = peelByPeriod(input, period, div);
       if (peeled.offsets.empty())
@@ -227,6 +318,7 @@ public:
       Value mask = andi.getRhs();
       Value shiftC = shrui.getRhs();
 
+      // NOTE: rebuild the expression
       Value cur;
       if (peeled.base) {
         Value masked = arith::AndIOp::create(b, loc, peeled.base, mask);
@@ -236,10 +328,13 @@ public:
         cur = arith::ConstantIntOp::create(b, loc, ty, 0);
       }
       for (Value v : peeled.offsets)
+        // NOTE: add the peeled offsets back
         cur = arith::AddIOp::create(b, loc, cur, v);
 
       xori.replaceAllUsesWith(cur);
       xori.erase();
+      // NOTE: only erases the old xori. The andi and shrui can be removed by the standard
+      // canonicalize pass.
     }
   }
 };

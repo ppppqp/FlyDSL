@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2025 FlyDSL Project Contributors
 
+/*
+NOTE:
+
+*/
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -328,6 +332,12 @@ public:
   using OpRewritePattern<MakeOrderedLayoutOp>::OpRewritePattern;
 
   LogicalResult matchAndRewrite(MakeOrderedLayoutOp op, PatternRewriter &rewriter) const override {
+    /*
+    NOTE:
+    An ordered layout specifies which dimension vary fastest. The pattern computes an explicit
+    stride tuple and replaces the abstract operation with a regular fly.make_layout
+    make_ordered_layout(shape=(M,N), order=(1,0)) -> make_layout(shape=(M,N), stride=(N,1))
+    */
     Location loc = op.getLoc();
     Value shapeValue = op.getShape();
     Value orderValue = op.getOrder();
@@ -356,6 +366,17 @@ public:
   using OpRewritePattern<MakeIdentityLayoutOp>::OpRewritePattern;
 
   LogicalResult matchAndRewrite(MakeIdentityLayoutOp op, PatternRewriter &rewriter) const override {
+    /*
+    NOTE:
+    An identity layout maps a coordinate to its natural linear index. Instead of immediately
+    flattening the identity layout into integer strides, Fly constructs a basis-tuple
+    representation.
+    Conceptually: identity_layout(shape=(M, N)) uses basis strides similar to (_1, _2)
+    where _1 and _2 mean "select coordinate component 0" and "select coordinate component 1"
+    This lets operations such as flat_divide preserve coordinate structure rather than prematurely
+    converting coordinates into a flat integer.
+    TODO(qiping): What does that suppose to mean?
+    */
     Location loc = op.getLoc();
     Value shapeValue = op.getShape();
     auto shapeTy = dyn_cast<IntTupleType>(shapeValue.getType());
@@ -398,6 +419,13 @@ public:
   using OpRewritePattern<MakeFragmentLikeOp>::OpRewritePattern;
 
   LogicalResult matchAndRewrite(MakeFragmentLikeOp op, PatternRewriter &rewriter) const override {
+
+    /*
+    NOTE:
+    This operation means allocate the register fragment with the same logical layout as this view.
+    The lowering extracts or materializes the fragment layout and replaces the abstract fragment
+    operation with fly.memref.alloca
+    */
     Location loc = op.getLoc();
     auto resultTy = cast<fly::MemRefType>(op.getType());
 
@@ -418,6 +446,22 @@ public:
   using OpRewritePattern<GetScalarOp>::OpRewritePattern;
 
   LogicalResult matchAndRewrite(GetScalarOp op, PatternRewriter &rewriter) const override {
+    /*
+    For example:
+    %layout = fly.make_layout %shape, %stride
+    %s = fly.get_shape %layout
+
+    can simply become:
+    %s = %shape
+
+    Similarly:
+    %view = fly.make_view %ptr, %layout
+    %layout2 = fly.get_layout %view
+
+    becomes:
+    %layout2 = %layout
+
+    */
     auto loc = op.getLoc();
     Value intTuple = op.getIntTuple();
 
@@ -436,11 +480,13 @@ public:
           op, "expected leaf IntTupleAttr after unwrapping rank-1 chain");
     auto intAttr = scalarAttr.extractIntFromLeaf();
     if (intAttr.isStatic()) {
+      // NOTE: a static tuple element becomes arith.constant
       Type resultTy = op.getResult().getType();
       rewriter.replaceOp(op,
                          arith::ConstantIntOp::create(rewriter, loc, resultTy, intAttr.getValue()));
       return success();
     } else {
+      // NOTE: a dynamic tuple element becomes the corresponding operand of fly.make_int_tuple
       auto defOp = intTuple.getDefiningOp<MakeIntTupleOp>();
       if (!defOp)
         return failure();
@@ -610,6 +656,23 @@ public:
 // IntTuple operations
 //===----------------------------------------------------------------------===//
 
+/*
+NOTE:
+Fly layouts are built from recursive int tuples, so the pass has patterns for operations such as
+add, sub, mul, div, mod, product, product_each, product_like
+shape_div, ceil_div, elem_less, equal, get, take, select, group
+append, prepend, slice, dice
+
+The common pattern is:
+IntTupleValueAdapter lhs(op.getLhs());
+IntTupleValueAdapter rhs(op.getRhs());
+
+auto result = intTupleAdd(builder, lhs, rhs);
+rewriter.replaceOp(op, builder.finalize(result));
+
+For instance, (4, %n) * (2, 8) can fold the first component to 8 while emitting an arith.muli for %n
+* 8
+*/
 template <typename OpTy, typename UnaryOpFn>
 class IntTupleUnaryOpLowering : public OpRewritePattern<OpTy> {
 public:
@@ -1149,7 +1212,17 @@ public:
     return success();
   }
 };
+/*
+Given a coordinate and layout:
+layout = shape: (M, N), stride: (N, 1)
+coord = (i, j)
 
+it constructs: i * N + j
+
+Static pieces are folded; dynamic pieces become ordinary arith operations.
+It also handles composed and swizzled layouts. In those cases, the pass first applies the inner
+coordinate transformation and then computes the final index.
+*/
 class Crd2IdxLowering : public OpRewritePattern<Crd2IdxOp> {
 public:
   using OpRewritePattern<Crd2IdxOp>::OpRewritePattern;
@@ -1788,6 +1861,17 @@ public:
 //===----------------------------------------------------------------------===//
 // TiledCopy/TiledMma Partition Lowering
 //===----------------------------------------------------------------------===//
+
+/*
+NOTE:
+1. Extract the view's iterator and layout.
+2. Obtain the tiled copy's thread/value layout
+3. Compose that thread/value layout with the input tensor layout
+4. Expand the result into logical dimensions: (thread, value, outer...)
+5. Construct an expanded view
+6. Slice the thread dimension using the current thread ID
+The result is a view containing only the elmements assigned to one thread.
+*/
 
 template <typename OpTy,
           LayoutValueAdaptor (*ThrValViewFunc)(LayoutBuilder<LayoutValueAdaptor> &, CopyAtomType,
@@ -2993,6 +3077,7 @@ namespace layout_rewrite {
 
 namespace memref_rewrite {
 #include "flydsl/Dialect/Fly/Transforms/MemrefLowering.cpp.inc"
+
 } // namespace memref_rewrite
 
 //===----------------------------------------------------------------------===//
@@ -3009,7 +3094,13 @@ public:
     MLIRContext *context = &getContext();
 
     RewritePatternSet patterns(context);
-
+    /* NOTE:
+    Conceptually, the lowering looks like:
+    1. abstact layout expressions
+    2. normal form tuple/layout constructors
+    3. explicit views, slices, offsets and coordinates
+    4. copy/MMA atom calls and vector operations
+    */
     // Constructors
     patterns
         .add<MakeOrderedLayoutOpLowering, MakeIdentityLayoutOpLowering, MakeLayoutLikeOpLowering,
