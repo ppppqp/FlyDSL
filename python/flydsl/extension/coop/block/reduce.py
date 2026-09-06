@@ -60,6 +60,29 @@ class BlockReduceAlgorithm(enum.Enum):
 # One function per BlockReduceAlgorithm, each paired with the shared storage it
 # needs in _SHARED_STORAGE below.
 
+"""
+NOTE:
+The data flow:
+  Per-thread scalar or vector
+            │
+            ▼
+  Reduce local Vector to one scalar
+            │
+            ▼
+  Warp reduction
+            │
+            ▼
+  One aggregate stored per warp in LDS
+            │
+         barrier
+            │
+            ▼
+  Every thread folds the warp aggregates
+            │
+            ▼
+  Block total in every thread
+"""
+
 
 @jit
 def _reduce_warp_reductions(partial, tid, slots, op, warp_reduce, warp_threads, num_warps):
@@ -70,9 +93,12 @@ def _reduce_warp_reductions(partial, tid, slots, op, warp_reduce, warp_threads, 
     else:
         lane = tid % warp_threads
         warp_id = tid // warp_threads
+
+        # NOTE: store the aggregated result in LDS
         if lane == 0:
             slots[warp_id] = aggregate
         barrier()
+
         # Every thread folds the same num_warps values, so the result is valid
         # block-wide and no second barrier is needed to broadcast it.
 
@@ -83,6 +109,8 @@ def _reduce_warp_reductions(partial, tid, slots, op, warp_reduce, warp_threads, 
         total = slots[0]
         for i in range_constexpr(1, num_warps):
             total = combine(op, total, slots[i])
+        # NOTE: After barrier, every thread reads and folds the same set of LDS slots. Therefore
+        # every thread gets the total without a second broadcast barrier
     return total
 
 

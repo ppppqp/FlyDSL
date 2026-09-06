@@ -121,6 +121,14 @@ def _wave64_reduce(value, op):
     that way -- but the two are indistinguishable for the commutative ops this
     library accepts, so the flip is left for whoever needs it.
     """
+
+    """
+    NOTE:
+    1. Reduces within each 16-lane row using DPP row_shr
+    2. Combines the four row totals using row_bcast15 and row_bcast31
+    3. Broadcasts lane 63's final result using readlane
+    """
+
     neutral = identity(op, value.dtype)
 
     acc = value

@@ -33,6 +33,9 @@ def resolve_warp_width(width, what):
 
 
 def combine(op, lhs, rhs):
+    """
+    NOTE: High-level reduction enum to FlyDSL arithmetic.
+    """
     if op is ReductionOp.ADD:
         return lhs + rhs
     if op is ReductionOp.MUL:
@@ -86,11 +89,27 @@ def seed(value, op, init):
     ``init ⊕ identity == init``, so seeding the inclusive and the exclusive
     form is the same one operation applied to both.
     """
+
+    """
+    NOTE:
+    prefix = fx.coop.warp_exclusive_scan(
+      value,
+      fx.ReductionOp.ADD,
+      init=fx.Int32(100), # explicit prefix here for initialization
+    )
+    """
     return value if init is None else combine(op, init, value)
 
 
 def thread_partial(value, op):
     """Fold a per-thread ``Vector`` down to one scalar; pass a scalar through."""
+
+    """
+    NOTE: block reduction accepts either one scalar or a Vector per thread:
+    For a vector, the block algorithm first reduces each thread's local item to one scalar, then reduces
+    those scalars across the block.
+    (local reduction first)
+    """
     return value.reduce(op) if isinstance(value, Vector) else value
 
 

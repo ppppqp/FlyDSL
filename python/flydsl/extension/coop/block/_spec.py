@@ -47,6 +47,20 @@ class BlockAlgorithmMeta(type):
         """The policy to use when the caller does not name one."""
         raise NotImplementedError(f"{cls.__name__} must implement _default_algorithm_for")
 
+    """
+    NOTE:
+    computes and caches a new specialized python class with attributes resmbling:
+    block_scan.dtype = fx.Int32
+    block_scan.block_size = (256, 1, 1)
+    block_scan.block_threads=256
+    block_scan.warp_threads=64
+    block_scan.num_warps=4
+    block_scan.algorithm = BlockScanAlgorithm.WARP_SCANS
+    block_scan.SharedStorage = Struct["slots": Array[...]]
+
+    This is target sensitive.
+    """
+
     def __getitem__(cls, params):
         if cls.block_threads is not None:
             raise TypeError(f"{cls.__name__} is already specialized")

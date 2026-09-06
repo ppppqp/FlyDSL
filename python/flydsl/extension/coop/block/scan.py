@@ -48,6 +48,26 @@ class BlockScanAlgorithm(enum.Enum):
 # scan produces follows from that exclusive prefix by one `combine`, so the
 # inclusive and exclusive forms do not need separate policies.
 
+"""
+NOTE:
+  Input value
+      │
+      ▼
+  Warp inclusive + exclusive scan + aggregate
+      │
+      ▼
+  Last lane writes its warp aggregate to LDS
+      │
+   barrier
+      │
+      ▼
+  Fold aggregates of all preceding warps into local prefix
+      │
+      ├── exclusive result = prefix
+      └── inclusive result = prefix ⊕ input
+
+"""
+
 
 @jit
 def _prefix_warp_scans(partial, tid, slots, op, warp_scan_with_aggregate, warp_threads, num_warps):
@@ -74,6 +94,7 @@ def _prefix_warp_scans(partial, tid, slots, op, warp_scan_with_aggregate, warp_t
         # make it logarithmic: warp 0 scans the num_warps totals, and each
         # thread then reads the single entry in front of its own warp.
         for i in range_constexpr(num_warps - 2, -1, -1):
+            # NOTE: Folds the preceding wave totals from highest to lowest for noncommutative assocative operators.
             prefix = (warp_id > i).select(combine(op, slots[i], prefix), prefix)
         # Same slots, folded unconditionally: that is the whole block.
         aggregate = slots[0]

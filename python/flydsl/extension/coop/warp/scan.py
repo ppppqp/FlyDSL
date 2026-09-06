@@ -46,6 +46,13 @@ def _hillis_steele(value, op, width):
     Each round folds in the lane *offset* below, whose result is kept only
     where that lane exists.
     """
+
+    """
+    NOTE:
+    At each iteration, every lane combines its value with a value some distance to its left.
+    The distances double: 1, 2, 4, 8, 16, 32 for a 64-lane wave.
+    A[i] = A[i] ⊕ A[i - offset] if i >= offset else A[i] for offset in [1, 2, 4, 8, 16, 32]
+    """
     offset = 1
     while offset < width:
         shifted, valid = _shuffle_up(value, offset, width)
