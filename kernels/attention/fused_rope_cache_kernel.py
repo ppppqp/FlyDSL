@@ -78,6 +78,7 @@ def build_fused_rope_cache_module(
     # For D=64:  VEC_WIDTH=1 -> vecs_per_head=64 (full wavefront, 16-bit loads).
     # For D=96:  VEC_WIDTH=2 -> vecs_per_head=48 (fits within one wavefront).
     # For D=128: VEC_WIDTH=2 -> vecs_per_head=64 (32-bit loads, unchanged).
+    # NOTE: ceil(head_dim/warp_size), which means evenly distributing the head_dim across the warp threads
     VEC_WIDTH = max(1, (head_dim + WARP_SIZE - 1) // WARP_SIZE)
 
     vecs_per_half = half_dim // VEC_WIDTH
@@ -119,6 +120,7 @@ def build_fused_rope_cache_module(
         KScale: fx.Tensor,
         VScale: fx.Tensor,
     ):
+        # NOTE: one block -> one token x one head index
         head_idx = fx.block_idx.x
         pid_t = fx.block_idx.y
         tid = fx.thread_idx.x
@@ -156,11 +158,14 @@ def build_fused_rope_cache_module(
         def ds_bpermute_pair(vec_val, pair_byte_addr):
             """Return the copy of vec_val held by the rotary-pair thread, via ds_bpermute."""
             if const_expr(VEC_WIDTH == 1):
+                # NOTE: a single BF16 value is only 16 bits, so convert to 32 bits for ds_bpermute, then convert back to BF16.
                 # vector<1xf16/bf16> → extract scalar → bitcast to i16 → zero-extend i32
                 elem_val = vec_val[0]
                 i16_val = ArithValue(elem_val).bitcast(T.i16)
                 i32_val = ArithValue(i16_val).extui(T.i32)
                 # Cross-lane shuffle: get pair thread's 32-bit VGPR (pair elem in low 16 bits)
+                # NOTE: backward compute. pair_byte_addr is the byte offset of the pair thread,
+                # which holds the pair elements in the second half
                 peer_i32 = fx.rocdl.ds_bpermute(T.i32, pair_byte_addr, i32_val)
                 # Truncate back to i16, bitcast to elem_type, reconstruct vector<1xelem_type>
                 peer_i16 = ArithValue(peer_i32).trunci(T.i16)
@@ -169,39 +174,55 @@ def build_fused_rope_cache_module(
             else:
                 # VEC_WIDTH>=2: VEC_WIDTH bf16/f16 elements → n_i32 x i32, one ds_bpermute per chunk.
                 # VEC_WIDTH=2 → n_i32=1 (32 bits); VEC_WIDTH=4 → n_i32=2 (64 bits), etc.
+
+                # NOTE: every pair of 16 bit values forms one 32-bit chunk, so group them into group of 2
                 n_i32 = VEC_WIDTH // 2
                 v_i32 = Vec(vec_val).bitcast(fx.Int32)
                 peer_chunks = []
                 for ci in range_constexpr(n_i32):
+                    # NOTE: for each group, get its pair element
                     chunk = v_i32[ci]
                     peer_chunks.append(fx.rocdl.ds_bpermute(T.i32, pair_byte_addr, chunk))
+                # NOTE: convert back
                 peer_v_i32 = Vec.from_elements(peer_chunks, fx.Int32)
                 return peer_v_i32.bitcast(elem_dtype)
 
         if tid < vecs_per_head:
             # --- Load position (scalar i32) ---
             pos_rsrc = buffer_ops.create_buffer_resource(Positions, max_size=True)
+
+            # NOTE: computes the index
             if const_expr(pos_dtype == "i64"):
                 pos_elem_off = pid_t * 2
             else:
                 pos_elem_off = pid_t
+
+            # NOTE: load into buffer (scalar i32)
             pos_val = buffer_ops.buffer_load(pos_rsrc, pos_elem_off, vec_width=1, dtype=T.i32)
 
             is_first_half = tid < vecs_per_half
+            # NOTE: frequency vector index
             cos_vec_idx = tid % vecs_per_half if reuse_freqs_front_part else tid
 
             # Pair lane for ds_bpermute: tid XOR vecs_per_half (symmetric, works for both halves).
             # pair_byte_addr = pair_lane * 4 (ds_bpermute address unit is bytes, VGPR = 4 bytes).
             pair_lane = tid ^ vecs_per_half
+
+            # NOTE: times 4 because it is byte address, and each thread's VGPR is 4 bytes (32 bits) wide, even for bf16/f16.
             pair_byte_addr = pair_lane * 4
 
             # --- Shared cos/sin (loaded once, used by both Q and K) ---
             Cos_buf = fx.rocdl.make_buffer_tensor(CosCache)
             Sin_buf = fx.rocdl.make_buffer_tensor(SinCache)
+
+            # NOTE: get the buffer corresponding to the position
             cos_row = fx.slice(Cos_buf, (pos_val, None))
             sin_row = fx.slice(Sin_buf, (pos_val, None))
+
+            # NOTE: divide into per-thread vectors (VEC_WIDTH) for loading. Note pos_val is for the token, not the thread local index.
             cos_div = fx.logical_divide(cos_row, vec_div_lay)
             sin_div = fx.logical_divide(sin_row, vec_div_lay)
+            # NOTE: load the cos/sin vector for this thread (VEC_WIDTH elements). This is reused for both Q and K paths, so only load once per block.
             cos_e = load_vec(cos_div, cos_vec_idx)
             sin_e = load_vec(sin_div, cos_vec_idx)
 
@@ -210,11 +231,13 @@ def build_fused_rope_cache_module(
                 Q_buf = fx.rocdl.make_buffer_tensor(Q)
                 Q_out_buf = fx.rocdl.make_buffer_tensor(Q_out)
 
+                # NOTE: get the buffer, divide it for load later
                 q_row = fx.slice(Q_buf, (pid_t, head_idx, None))
                 q_div = fx.logical_divide(q_row, vec_div_lay)
                 qo_row = fx.slice(Q_out_buf, (pid_t, head_idx, None))
                 qo_div = fx.logical_divide(qo_row, vec_div_lay)
 
+                # NOTE: each thread loads a vector of VEC_WIDTH elements, rotates it, and stores it back to Q_out.
                 q_e_vec = load_vec(q_div, tid)
                 q_e = q_e_vec
                 # Use ds_bpermute to get pair element via LDS cross-lane shuffle (no VMEM).
