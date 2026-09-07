@@ -87,6 +87,33 @@ def _reduce_warp_reductions(partial, tid, slots, op, warp_reduce, warp_threads, 
 
 
 @jit
+def _reduce_warp_reductions_to_leader(partial, tid, slots, op, warp_reduce, warp_threads, num_warps):
+    """Reduce to linear thread 0 without forming the cross-warp result block-wide."""
+    aggregate = warp_reduce(partial, op, width=warp_threads)
+    if const_expr(num_warps == 1):
+        total = aggregate
+    else:
+        lane = tid % warp_threads
+        warp_id = tid // warp_threads
+        if lane == 0:
+            slots[warp_id] = aggregate
+        barrier()
+
+        # Only the first warp consumes the per-warp totals. Its first
+        # ``num_warps`` lanes form one logical group, so the second fold is
+        # logarithmic and leaves the block aggregate in linear thread 0.
+        total = partial
+        if warp_id == 0:
+            in_range = lane < num_warps
+            lane_safe = in_range.select(lane, 0)
+            # Only group 0 contributes to thread 0; the other width-sized
+            # groups may safely read slot 0 because their results are ignored.
+            wave_total = slots[lane_safe]
+            total = warp_reduce(wave_total, op, width=num_warps)
+    return total
+
+
+@jit
 def _reduce_raking(partial, tid, slots, result, op, warp_reduce, warp_threads, segment_length):
     """Stage every thread's partial in shared memory, then rake it with a single warp."""
     if const_expr(segment_length == 1):
@@ -107,6 +134,24 @@ def _reduce_raking(partial, tid, slots, result, op, warp_reduce, warp_threads, s
                 result[0] = raked
         barrier()
         total = result[0]
+    return total
+
+
+@jit
+def _reduce_raking_to_leader(partial, tid, slots, op, warp_reduce, warp_threads, segment_length):
+    """Rake to linear thread 0 without staging and broadcasting the result."""
+    if const_expr(segment_length == 1):
+        total = warp_reduce(partial, op, width=warp_threads)
+    else:
+        slots[tid] = partial
+        barrier()
+        total = partial
+        if tid < warp_threads:
+            base = tid * segment_length
+            raked = slots[base]
+            for i in range_constexpr(1, segment_length):
+                raked = combine(op, raked, slots[base + i])
+            total = warp_reduce(raked, op, width=warp_threads)
     return total
 
 
@@ -192,8 +237,10 @@ class BlockReduce(metaclass=_BlockReduceMeta):
 
         block_reduce = fx.coop.BlockReduce[fx.Float32, fx.known_block_size()]
 
-    ``value`` is either one scalar per thread or a ``Vector`` of several per-thread items. The
-    result is valid in every thread of the block, not only in one of them.
+    ``value`` is either one scalar per thread or a ``Vector`` of several per-thread items. Calling
+    the specialization directly returns a result valid in every thread of the block.
+    :meth:`reduce_to_leader` instead leaves it valid only in linear thread 0, avoiding replicated
+    cross-warp work when that one thread is the sole consumer.
 
     Every thread of the block has to reach this call, and reach it together. It synchronizes the
     block and reads across lanes, so a call made under a condition that is not uniform block-wide
@@ -207,6 +254,42 @@ class BlockReduce(metaclass=_BlockReduceMeta):
     Reusing *storage* for a second collective call needs a :func:`~flydsl.expr.gpu.barrier` in
     between, since this one leaves the block unsynchronized after its last read.
     """
+
+    @classmethod
+    def reduce_to_leader(cls, value, op, *, storage):
+        """Reduce the block with a result valid only in linear thread 0.
+
+        Every thread must call this method, just as for the broadcast form.
+        Only linear thread 0 may consume the returned value; its value in every
+        other thread is unspecified. This avoids forming the cross-warp result
+        block-wide when one leader will store or otherwise consume it.
+
+        Reusing *storage* still requires a block barrier after this call.
+        """
+        if cls.block_threads is None:
+            raise TypeError("specialize first, e.g. BlockReduce[fx.Float32, 256]")
+
+        partial = thread_partial(value, op)
+        tid = linear_thread_id(cls.block_size)
+        if cls.algorithm is BlockReduceAlgorithm.WARP_REDUCTIONS:
+            return _reduce_warp_reductions_to_leader(
+                partial,
+                tid,
+                storage.slots,
+                op,
+                cls.warp_ops.warp_reduce,
+                cls.warp_threads,
+                cls.num_warps,
+            )
+        return _reduce_raking_to_leader(
+            partial,
+            tid,
+            storage.slots,
+            op,
+            cls.warp_ops.warp_reduce,
+            cls.warp_threads,
+            cls.num_warps,
+        )
 
     dtype = None
     block_size = None

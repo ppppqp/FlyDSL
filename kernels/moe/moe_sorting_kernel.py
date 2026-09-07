@@ -1274,16 +1274,11 @@ def _compile_moe_sorting_multiphase(
     # 256 threads (4 waves), vec_width=4: each thread loads 4 i32 words (16
     # mesh cells) per iteration.  4 waves provide 4x memory-level parallelism
     # vs the old 1-wave (64-thread) design, matching CK P1's block size.
-    # Cross-warp reduction via LDS (4 partial sums, one per warp).
     K3_BLOCK = 256
-    K3_NUM_WAVES = K3_BLOCK // WARP_SIZE
     K3_VEC_WIDTH = 4
     K3_WORDS_PER_ITER = K3_BLOCK * K3_VEC_WIDTH
     K3_WORDS_PER_ITER_LOG2 = (K3_WORDS_PER_ITER).bit_length() - 1
-
-    @fx.struct
-    class P1SharedStorage:
-        reduce: fx.Array[fx.Int32, K3_NUM_WAVES, 16]
+    p1_block_reduce = fx.coop.BlockReduce[fx.Int32, K3_BLOCK]
 
     @flyc.kernel
     def p1_count_kernel(
@@ -1294,16 +1289,13 @@ def _compile_moe_sorting_multiphase(
     ):
         eid = gpu.block_idx.x
         tid = gpu.thread_idx.x
-        lane = tid % WARP_SIZE
-        wave = tid // WARP_SIZE
 
         ws_rsrc = buffer_ops.create_buffer_resource(workspace, max_size=True)
         c_zero = fx.Int32(0)
         c_one = fx.Int32(1)
         c_ff = fx.Int32(0xFF)
 
-        lds = fx.SharedAllocator().allocate(P1SharedStorage).peek()
-        reduce_mr = lds.reduce.ptr
+        reduce_storage = fx.SharedAllocator().allocate(p1_block_reduce.SharedStorage).peek()
 
         mesh_row_i32_base = (eid * i32_mesh_stride) >> fx.Int32(2)
         i32_words_per_row = i32_mesh_stride >> fx.Int32(2)
@@ -1343,25 +1335,9 @@ def _compile_moe_sorting_multiphase(
             results = yield [new_cnt]
         cnt = results
 
-        cnt = fx.coop.warp_reduce(cnt, fx.ReductionOp.ADD, width=WARP_SIZE)
-
-        # Cross-warp reduce via LDS: lane 0 of each warp writes partial sum
-        is_lane0 = lane == c_zero
-        if is_lane0:
-            wave_ix = ArithValue(wave).index_cast(T.index)
-            _lds_store_raw(reduce_mr, cnt, wave_ix)
-        gpu.barrier()
-
-        # Thread 0 sums all warp partials and writes to HBM
-        is_t0 = tid == c_zero
-        total = c_zero
-        for _w in range_constexpr(K3_NUM_WAVES):
-            total = total + _lds_load_raw(reduce_mr, fx.Int32(_w))
-
-        cs_offset = i32_mesh_size + eid
-        c_oob_idx = fx.Int32(0x7FFFFFFF)
-        safe_cs = is_t0.select(cs_offset, c_oob_idx)
-        buffer_ops.buffer_store(total, ws_rsrc, safe_cs)
+        total = p1_block_reduce.reduce_to_leader(cnt, fx.ReductionOp.ADD, storage=reduce_storage)
+        if tid == c_zero:
+            buffer_ops.buffer_store(total, ws_rsrc, i32_mesh_size + eid)
 
     @flyc.jit
     def launch_p1(
@@ -1379,18 +1355,13 @@ def _compile_moe_sorting_multiphase(
     # Grid: E blocks (one per expert), Block: 512 threads (matching CK P0_v2).
     # Phase 1: clear this expert's mesh row
     # Phase 2: scan all T*topk assignments, filter by expert, byte stores
-    # Phase 3: popcount + warp reduce + cross-wave LDS reduce -> expert_cumsum
+    # Phase 3: popcount + leader-only block reduction -> expert_cumsum
     P0V2_BLOCK = 512
-    P0V2_NUM_WAVES = P0V2_BLOCK // WARP_SIZE
+    p0v2_block_reduce = fx.coop.BlockReduce[fx.Int32, P0V2_BLOCK]
 
     # Power-of-2 topk: use shift to avoid division
     _p0v2_topk_is_po2 = (topk & (topk - 1)) == 0 and topk > 0
     _p0v2_topk_log2 = topk.bit_length() - 1 if _p0v2_topk_is_po2 else 0
-
-    # LDS for cross-wave reduction (same layout as K3)
-    @fx.struct
-    class P0V2SharedStorage:
-        reduce: fx.Array[fx.Int32, P0V2_NUM_WAVES, 16]
 
     @flyc.kernel(known_block_size=[P0V2_BLOCK, 1, 1])
     def p0v2_kernel(
@@ -1403,8 +1374,6 @@ def _compile_moe_sorting_multiphase(
     ):
         eid = gpu.block_idx.x
         tid = gpu.thread_idx.x
-        lane = tid % WARP_SIZE
-        wave = tid // WARP_SIZE
 
         ws_rsrc = buffer_ops.create_buffer_resource(workspace, max_size=True)
         mask_rsrc = buffer_ops.create_buffer_resource(expert_mask_tensor, max_size=True)
@@ -1416,8 +1385,7 @@ def _compile_moe_sorting_multiphase(
         c_topk = fx.Int32(topk)
         c_block = fx.Int32(P0V2_BLOCK)
 
-        lds = fx.SharedAllocator().allocate(P0V2SharedStorage).peek()
-        reduce_mr = lds.reduce.ptr
+        reduce_storage = fx.SharedAllocator().allocate(p0v2_block_reduce.SharedStorage).peek()
 
         # Precompute mesh row base (in i32 words) and words per row
         mesh_row_i32_base = (eid * i32_mesh_stride) >> fx.Int32(2)
@@ -1466,7 +1434,7 @@ def _compile_moe_sorting_multiphase(
 
         gpu.barrier()
 
-        # ---- Phase 3: Count non-zero bytes + warp/cross-wave reduce ----
+        # ---- Phase 3: Count non-zero bytes + leader-only block reduce ----
         count_niters = clear_niters  # same loop structure, reuse (already EP-gated)
         for _ki, state in range(fx.Index(0), ArithValue(count_niters).index_cast(T.index), fx.Index(1), init=[c_zero]):
             cnt_so_far = state[0]
@@ -1490,25 +1458,9 @@ def _compile_moe_sorting_multiphase(
             results = yield [new_cnt]
         cnt = results
 
-        cnt = fx.coop.warp_reduce(cnt, fx.ReductionOp.ADD, width=WARP_SIZE)
-
-        # Cross-warp reduce via LDS: lane 0 of each warp writes partial sum
-        is_lane0 = lane == c_zero
-        if is_lane0:
-            wave_ix = ArithValue(wave).index_cast(T.index)
-            _lds_store_raw(reduce_mr, cnt, wave_ix)
-        gpu.barrier()
-
-        # Thread 0 sums all warp partials and writes to HBM
-        is_t0 = tid == c_zero
-        total = c_zero
-        for _w in range_constexpr(P0V2_NUM_WAVES):
-            total = total + _lds_load_raw(reduce_mr, fx.Int32(_w))
-
-        cs_offset = i32_mesh_size + eid
-        c_oob_idx = fx.Int32(0x7FFFFFFF)
-        safe_cs = is_t0.select(cs_offset, c_oob_idx)
-        buffer_ops.buffer_store(total, ws_rsrc, safe_cs)
+        total = p0v2_block_reduce.reduce_to_leader(cnt, fx.ReductionOp.ADD, storage=reduce_storage)
+        if tid == c_zero:
+            buffer_ops.buffer_store(total, ws_rsrc, i32_mesh_size + eid)
 
     @flyc.jit
     def launch_p0v2(

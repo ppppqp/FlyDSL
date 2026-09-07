@@ -56,11 +56,22 @@ ALGORITHMS = (
 BLOCK_SHAPES = ((64, 1, 1), (128, 1, 1), (256, 1, 1), (64, 2, 2), (128, 2, 2))
 
 
-def run_block_reduce(values, name, dtype, *, block_size, algorithm, items_per_thread=1, op=None, universal=False):
+def run_block_reduce(
+    values,
+    name,
+    dtype,
+    *,
+    block_size,
+    algorithm,
+    items_per_thread=1,
+    op=None,
+    universal=False,
+    leader_only=False,
+):
     """Reduce *values* with one ``BlockReduce`` call per thread.
 
-    Returns the per-thread results on the host: the reduction is valid
-    block-wide, so every entry should hold the same total.
+    Returns the output buffer on the host. The ordinary reduction fills every
+    entry; with *leader_only*, only entry 0 is written.
 
     *universal* picks ``fx.coop.universal.BlockReduce``, the form that folds
     through the portable warp reduction, over the dispatched one.
@@ -86,7 +97,12 @@ def run_block_reduce(values, name, dtype, *, block_size, algorithm, items_per_th
         block_reduce = namespace.BlockReduce[dtype, block_size, algorithm]
         storage = fx.SharedAllocator().allocate(block_reduce.SharedStorage).peek()
         tid = linear_tid(block_size)
-        Out[tid] = block_reduce(read(A, tid), op, storage=storage)
+        if leader_only:
+            total = block_reduce.reduce_to_leader(read(A, tid), op, storage=storage)
+            if tid == 0:
+                Out[0] = total
+        else:
+            Out[tid] = block_reduce(read(A, tid), op, storage=storage)
 
     @flyc.jit
     def launch(A: fx.Tensor, Out: fx.Tensor, stream: fx.Stream = fx.Stream(None)):
@@ -129,6 +145,29 @@ def test_sum_over_a_full_tile(entry, items_per_thread, algorithm):
         values, name, dtype, block_size=block_size, algorithm=algorithm, items_per_thread=items_per_thread
     )
     check_sum(values, out, name)
+
+
+@pytest.mark.l2_device
+@pytest.mark.rocm_lower
+@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires GPU")
+@pytest.mark.parametrize("algorithm", ALGORITHMS, ids=lambda a: a.name)
+@pytest.mark.parametrize("items_per_thread", (1, 4))
+def test_sum_to_leader(algorithm, items_per_thread):
+    """The leader-only form returns the aggregate in linear thread 0."""
+    BLOCK = 256
+    values = sample("torch.int32", BLOCK * items_per_thread)
+    out = run_block_reduce(
+        values,
+        "torch.int32",
+        fx.Int32,
+        block_size=(BLOCK, 1, 1),
+        algorithm=algorithm,
+        items_per_thread=items_per_thread,
+        leader_only=True,
+    )
+
+    assert out[0] == wrap(values.cpu().to(torch.int64).sum(), "torch.int32")
+    assert torch.count_nonzero(out[1:]) == 0
 
 
 @pytest.mark.l2_device
