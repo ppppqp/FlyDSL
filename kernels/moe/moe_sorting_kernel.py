@@ -20,6 +20,71 @@ Packed token ID format: (topk_position << 24) | token_id
   - Padding sentinel: (topk << 24) | M
 """
 
+"""
+NOTE:
+# Why Moe needs sorting:
+Suppose four tokens select two experts each:
+token 0 -> experts [2, 0]
+token 1 -> experts [1, 2]
+token 2 -> experts [0, 2]
+token 3 -> experts [0, 1]
+
+The router output is organized by token:
+token 0: (expert 2, expert 0)
+token 1: (expert 1, expert 2)
+...
+
+But an expert GEMM wants all rows of the same expert together:
+expert 0: token 0, token 2, token 3
+expert 1: token 1, token 3
+expert 2: token 0, token 1, token 2
+
+Each expert's list is also padded to the GEMM tile-M size, normally 32:
+UINT_SIZE = 32
+
+So if expert 0 has three tokens, its sorted segment occupies 32 entries (3 real + 29 padded)
+This lets the downstream GEMM launch one or more uniform 32-row tiles per expert.\
+
+NOTE: # Output representation
+The output representation is a packed token ID:
+
+    (topk_position << 24) | token_id
+
+The lower 24 bits identify the token. The upper eight bits identify which top-k selection led to that expert.
+For example:
+token 37, top-k slot 3 -> (3 << 24) | 37 = 0x03000025
+This lets the downstream code recover both token id  and topk_slot. The topk_slot is necessary to find the matching router weight:
+topk_weights[token_id, topk_slot]
+
+
+NOTE: Execution paths
+The file supports three strategies:
+
+   Token count           Strategy                      Kernel launches
+  ━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━
+   Small                 Oneshot, LDS mesh                           1
+  ────────────────────  ────────────────────────────  ─────────────────
+   Medium, up to 2048    Fused P0v2 + P23, HBM mesh                  2
+  ────────────────────  ────────────────────────────  ─────────────────
+   Large, above 2048     Clear + P0 + P1 + P23                       4
+
+All three execute the same logical algorithm:
+  histogram mesh
+      ↓
+  count assignments per expert
+      ↓
+  round counts up to GEMM tile size
+      ↓
+  exclusive prefix sum
+      ↓
+  scatter token IDs and weights
+      ↓
+  fill padding and expert tile IDs
+
+The difference is where the mesh lives and how much work is fused.
+"""
+
+
 import functools
 
 import torch
@@ -46,6 +111,10 @@ WARP_SIZE = get_warp_size()
 @flyc.jit
 def _zero_moe_buf_grid_stride(moe_buf_rsrc, gid_v4, stride_v4, total_v4, oob_idx):
     """Grid-stride loop zeroing moe_buf via vectorized buffer_store."""
+    """
+    NOTE: zeros four I32 elements per store.
+    It uses a grid-stride loop so a bounded number of GPU blocks can clear an arbitrarily large output buffer.
+    """
     c_one = fx.Int32(1)
     niters = (total_v4 + stride_v4 - c_one) // stride_v4
     c_zero_v4 = fx.Vector.filled(4, 0, fx.Int32)
@@ -61,6 +130,11 @@ def _extend_prefix_sum_serial(mr, start_block, E, load_fn, store_fn):
 
     Reads mr[start_block], then accumulates mr[start_block+1..E] in place.
     Returns the final accumulated value (mr[E]).
+    """
+
+    """
+    NOTE: handles cases where the number of experts exceeds the number of block threads.
+    The parallel scan handles the first thread-sized chunk. Thread 0 then continues through the remaining experts.
     """
     prev = load_fn(mr, fx.Int32(start_block))
     for _ext in range_constexpr(start_block, E):
@@ -82,6 +156,10 @@ def _write_expert_id_blocks(sorted_e_rsrc, local_eid, blk_start, n_blks):
 @flyc.jit
 def _fill_sentinel_slots(sorted_ids_rsrc, sorted_w_rsrc, start, count, sentinel, block_size, tid, oob_idx):
     """Cooperative sentinel fill: threads fill [start, start+count) with sentinels."""
+
+    """
+    NOTE: filling the paddings with sentinel.
+    """
     c_zero = fx.Int32(0)
     end = start + count
     niters = (count + fx.Int32(block_size) - fx.Int32(1)) // fx.Int32(block_size)
@@ -156,6 +234,9 @@ def _compile_moe_sorting_oneshot(
     arch = get_rocm_arch()
     E = num_experts
     # CDNA (warp64): 512 threads = 8 waves, affordable cross-wave reduction.
+    """
+    NOTE: Normally 256 experts fit natually into 256 threads. Larger expert counts may use 512 threads.
+    """
     max_oneshot_block = 512 if WARP_SIZE == 64 else 256
     ONESHOT_BLOCK = 256 if E <= 256 else min(512, max_oneshot_block)
     block_scan = fx.coop.BlockScan[fx.Int32, ONESHOT_BLOCK]
@@ -163,6 +244,7 @@ def _compile_moe_sorting_oneshot(
 
     # LDS sizing: sub_tokens rows for the token×expert histogram
     # Match CK's sizing: total LDS / occupancy / smem_cols, rounded to 8
+
     if arch in ("gfx942",) or str(arch).startswith("gfx94"):
         lds_capacity_bytes = 65536
     elif str(arch).startswith("gfx95"):
@@ -170,11 +252,13 @@ def _compile_moe_sorting_oneshot(
     else:
         lds_capacity_bytes = 65536  # conservative default
 
+    # NOTE: The oneshot mesh logically has: sub_tokens x (E+1) I32 entries
+    # The code estimates how many token rows fit in LDS while targeting two resident blocks per compute unit
     lds_capacity_ints = lds_capacity_bytes // 4
     target_occupancy = 2
     r = lds_capacity_ints // target_occupancy // smem_cols
-    sub_unroll = 8
-    cumsum_bufs = 2
+    sub_unroll = 8  # NOTE:
+    cumsum_bufs = 2  # NOTE: two additional expert-sized array for prefix sums
     if r < (cumsum_bufs + sub_unroll):
         raise ValueError(f"LDS too small for E={E}: need at least {(cumsum_bufs + sub_unroll) * smem_cols * 4} bytes")
     r_for_sub = ((r - cumsum_bufs) // sub_unroll) * sub_unroll
@@ -184,9 +268,11 @@ def _compile_moe_sorting_oneshot(
 
     @fx.struct
     class SharedStorage:
-        cumsum: fx.Array[fx.Int32, smem_cols, 16]
-        cumdup: fx.Array[fx.Int32, smem_cols, 16]
-        mesh: fx.Array[fx.Int32, sub_tokens * smem_cols, 16]
+        cumsum: fx.Array[fx.Int32, smem_cols, 16]  # NOTE: expert counts, then expert segment starts
+        cumdup: fx.Array[fx.Int32, smem_cols, 16]  # NOTE: temporary prefix-sum buffer and later scatter cursor
+        mesh: fx.Array[
+            fx.Int32, sub_tokens * smem_cols, 16
+        ]  # NOTE: mesh[token, expert]: records whether the token selected the expert, and which top-k slot
 
     @flyc.kernel(known_block_size=[ONESHOT_BLOCK, 1, 1])
     def moe_sorting_oneshot_kernel(
@@ -234,6 +320,7 @@ def _compile_moe_sorting_oneshot(
 
         # =================== MOE_BUF ZEROING (blocks > 0 only) ===============
         if bid != c_zero_i32:
+            # NOTE: blocks > 0, clear moe_buf
             zero_gid_v4 = (bid - c_one_i32) * fx.Int32(ONESHOT_BLOCK) + tid
             num_zero_blocks = gpu.grid_dim.x - c_one_i32
             zero_stride_v4 = num_zero_blocks * fx.Int32(ONESHOT_BLOCK)
@@ -243,8 +330,11 @@ def _compile_moe_sorting_oneshot(
 
         # =================== SORTING (block 0 only) ==========================
         if bid == c_zero_i32:
+            # NOTE: only perform sorting in block 0
+            # No need to sync between those blocks since they operate on different buffers.
             # ========================= PHASE 1: Histogram =========================
             # Clear mesh region — unconditional store to safe index when out of bounds
+            # NOTE clear entire LDS mesh in parallel
             for i_clear in range_constexpr(0, sub_tokens * smem_cols, ONESHOT_BLOCK):
                 idx = fx.Int32(i_clear) + tid
                 is_valid = idx < fx.Int32(sub_tokens * smem_cols)
@@ -257,6 +347,8 @@ def _compile_moe_sorting_oneshot(
             # Fill mesh: for each (token, topk_slot), write topk_slot+1 to mesh[token, expert_id]
             total_assignments = tokens * c_topk
             for i_assign in range_constexpr(0, max_tokens * topk, ONESHOT_BLOCK):
+                # NOTE: iteratve over all valid router assignments (tokens * topk)
+                # flat_idx: linearized index over (token, topk_slot) pairs
                 flat_idx = fx.Int32(i_assign) + tid
                 is_valid = flat_idx < total_assignments
                 safe_flat = is_valid.select(flat_idx, c_zero_i32)
@@ -265,6 +357,7 @@ def _compile_moe_sorting_oneshot(
                 topk_slot = safe_flat % c_topk
 
                 global_idx = token_id * c_topk + topk_slot
+                # NOTE: load topk_ids[token_id, topk_slot] = expert_id
                 eid = buffer_ops.buffer_load(topk_ids_rsrc, global_idx, vec_width=1, dtype=T.i32)
 
                 # mesh[token_id, eid] = topk_slot + 1 (valid threads only).
@@ -274,12 +367,16 @@ def _compile_moe_sorting_oneshot(
                 last_mesh_idx = fx.Int32(sub_tokens * smem_cols - 1)
                 safe_mesh_addr = is_valid.select(mesh_addr, last_mesh_idx)
                 safe_mesh_ix = ArithValue(safe_mesh_addr).index_cast(T.index)
+                # NOTE: write topk_slot+1 to mesh[token, expert] if valid, else write 0 to mesh[last]
+                # 0 means token did not select this expert; 1...topk is selected expert
                 val = is_valid.select(topk_slot + c_one_i32, c_zero_i32)
                 _lds_store_raw(mesh_mr, val, safe_mesh_ix)
             gpu.barrier()
 
             # ===================== PHASE 2: Count + Prefix Sum =====================
             c_lane_group_sz = fx.Int32(8)
+            # NOTE: threads are divided into eight-lane groups
+            # Each group hanldes one expert. Its eight lanes inspect eight token rows at a time
             lane_group_id = tid // c_lane_group_sz
             lane_group_os = tid % c_lane_group_sz
 
@@ -291,11 +388,14 @@ def _compile_moe_sorting_oneshot(
             gpu.barrier()
 
             for i_e in range_constexpr(0, E, ONESHOT_BLOCK // 8):
+                # NOTE: each group of 8 threads handles one expert, counting how many tokens selected it.
+                # get the expert ID for this lane group
                 eid_local = fx.Int32(i_e) + lane_group_id
                 eid_valid = eid_local < c_E
 
                 cnt = c_zero_i32
                 for i_sub in range_constexpr(0, sub_tokens, 8):
+                    # NOTE: each lane inspects one token row at a time
                     sub_idx = fx.Int32(i_sub) + lane_group_os
                     sub_valid = sub_idx < c_sub_tokens
                     combined_valid = eid_valid & sub_valid
@@ -304,6 +404,7 @@ def _compile_moe_sorting_oneshot(
                     safe_eid = combined_valid.select(eid_local, c_zero_i32)
                     mesh_rd_addr = safe_sub * c_smem_cols + safe_eid
                     mesh_rd_ix = ArithValue(mesh_rd_addr).index_cast(T.index)
+                    # NOTE: mesh[sub_token, expert]
                     mesh_val = _lds_load_raw(mesh_mr, mesh_rd_ix)
 
                     has_token = combined_valid.select(
@@ -335,12 +436,17 @@ def _compile_moe_sorting_oneshot(
                 cvt_ix = ArithValue(safe_cvt_idx).index_cast(T.index)
                 raw_cnt_cvt = _lds_load_raw(cumsum_mr, cvt_ix)
                 blocks_cvt = (raw_cnt_cvt + c_unit - c_one_i32) // c_unit
+                # NOTE: calculates the padded count for each expert, rounding up to the nearest multiple of unit_size.
+                # If the raw count is 0, we still want to write 0 to cumsum[eid+1] (no padding for experts with no tokens).
                 padded_cvt = (raw_cnt_cvt == c_zero_i32).select(c_zero_i32, blocks_cvt * c_unit)
                 # Valid threads write padded value; invalid threads write 0 to cumsum[0]
                 _lds_store_raw(cumsum_mr, cvt_valid.select(padded_cvt, c_zero_i32), cvt_ix)
             gpu.barrier()
 
             if has_mask:
+                # NOTE: expert_mask[e] = 1 means expert is local/enabled. Otherwise the expert is remote/masked
+                # for example, if mask = [0, 1, 0, 1, 1], then expert 1 has local id 0, expert 3 has local id 1, and expert 4 has local id 2.
+
                 # EP: zero padded count for masked experts in a separate pass.
                 # Loading from mask buffer inside the padded-count loop above interfered
                 # with expert 0 (MLIR codegen issue). Separate pass avoids this.
@@ -360,6 +466,8 @@ def _compile_moe_sorting_oneshot(
 
             # All threads read cumsum[tid+1] (in chunks for E > ONESHOT_BLOCK)
             for _ps_chunk in range_constexpr(0, E, ONESHOT_BLOCK):
+                # NOTE: the padded counts are copied into cumdup, then scanned using _allwave_inclusive_prefix_sum.
+                # cumsum[0] = 0, cumsum[e+1] = sum(padded_count[0:e+1])
                 ps_eid = fx.Int32(_ps_chunk) + tid
                 ps_valid = ps_eid < c_E
                 ps_safe_ix = ArithValue(ps_valid.select(ps_eid + c_one_i32, c_zero_i32)).index_cast(T.index)
@@ -459,6 +567,10 @@ def _compile_moe_sorting_oneshot(
                 cs_end_ix = ArithValue(safe_eid_wr + c_one_i32).index_cast(T.index)
                 e_start = _lds_load_raw(cumsum_mr, cs_start_ix)
                 e_end = eid_wr_valid.select(_lds_load_raw(cumsum_mr, cs_end_ix), e_start)
+
+                # NOTE: for each expert, the kernel writes the expert's ID for every tile in that interval
+                # sorted_expert_ids[blk_start .. blk_end) = local_eid]
+                # so the downstream GEMM block b can obtain its expert through expert = sorted_expert_ids[b]
                 local_eid = _lds_load_raw(cumdup_mr, cs_start_ix)
 
                 # Store cumdup: reuse cumdup for scatter phase position tracking.
@@ -518,20 +630,31 @@ def _compile_moe_sorting_oneshot(
                     safe_my_sub = my_sub_valid.select(my_sub, c_zero_i32)
                     my_mesh_addr = safe_my_sub * c_smem_cols + safe_eid_sc
                     my_mesh_ix = ArithValue(my_mesh_addr).index_cast(T.index)
+                    # NOTE:  for each lane, my_x = mesh[token, expert]
+                    # NOTE:  my_has_token = my_x != 0 (token selected this expert)
                     my_x = _lds_load_raw(mesh_mr, my_mesh_ix)
                     my_has_token = my_sub_valid & (my_x != c_zero_i32)
                     local_cnt = my_has_token.select(c_one_i32, c_zero_i32)
-
+                    """
+                    NOTE:
+                    The lanes compute an eight-lane inclusive prefix sum over my_has_token
+                    If the batch has
+                    [1, 0, 1, 1, 0, 0, 1, 0] (8 lanes), then the prefix sum is
+                    [1, 1, 2, 3, 3, 3, 4, 4] (8 lanes)                
+                    """
                     local_cnt, _, batch_total = fx.coop.warp_scan_with_aggregate(local_cnt, fx.ReductionOp.ADD, width=8)
 
                     # Scatter this lane's token
                     slot = position + local_cnt - c_one_i32
                     safe_x = my_has_token.select(my_x, c_one_i32)
+
+                    # NOTE: reconstruct packed ID from the mesh value
                     topk_slot_sc = safe_x - c_one_i32
                     packed_id = (topk_slot_sc << fx.Int32(24)) | my_sub
                     safe_slot = my_has_token.select(slot, c_oob_idx)
                     buffer_ops.buffer_store(packed_id, sorted_ids_rsrc, safe_slot)
 
+                    # NOTE: load the corresponding weight topk_weights[token_id * topk + topk_slot_sc]
                     w_addr = my_has_token.select(my_sub * c_topk + topk_slot_sc, c_zero_i32)
                     w_val_i32 = buffer_ops.buffer_load(weights_rsrc, w_addr, vec_width=1, dtype=T.i32)
                     buffer_ops.buffer_store(w_val_i32, sorted_w_rsrc, safe_slot)
