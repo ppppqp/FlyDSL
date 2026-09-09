@@ -11,6 +11,7 @@ from pathlib import Path
 
 
 def _is_metric(value: str) -> bool:
+
     if value in {"-", "skip"}:
         return True
     try:
