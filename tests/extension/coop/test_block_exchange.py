@@ -16,11 +16,6 @@ from flydsl._mlir import ir
 from flydsl._mlir.passmanager import PassManager
 from flydsl.compiler import jit_function
 from flydsl.compiler.backends.rocm import RocmBackend
-from flydsl.extension.coop.block.exchange import (
-    _blocked_rank,
-    _striped_rank,
-    _warp_striped_rank,
-)
 
 try:
     import torch
@@ -29,6 +24,24 @@ except ImportError:
 
 
 ITEM_COUNTS = (1, 2, 4, 8)
+
+
+def _blocked_rank(thread, item, block_threads, items_per_thread):
+    """Reference ``(thread, item) -> logical rank`` for a blocked layout."""
+    del block_threads
+    return thread * items_per_thread + item
+
+
+def _striped_rank(thread, item, block_threads, items_per_thread):
+    """Reference ``(thread, item) -> logical rank`` for a striped layout."""
+    del items_per_thread
+    return thread + item * block_threads
+
+
+def _warp_striped_rank(thread, item, warp_threads, items_per_thread):
+    """Reference logical rank for a layout striped independently per warp."""
+    warp_id, lane = divmod(thread, warp_threads)
+    return warp_id * warp_threads * items_per_thread + lane + item * warp_threads
 
 
 @pytest.fixture

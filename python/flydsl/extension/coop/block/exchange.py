@@ -15,26 +15,12 @@ __all__ = ["BlockExchange"]
 
 
 _CACHE = {}
+# This padding model is only valid for AMD targets with 32 four-byte LDS
+# banks (for example, gfx942). Some newer targets have 64 banks; until bank
+# geometry is target metadata, this implementation must not be assumed to
+# provide conflict-avoiding padding on those targets.
 _LDS_BANKS = 32
 _LDS_BANK_BYTES = 4
-
-
-def _blocked_rank(thread, item, block_threads, items_per_thread):
-    """Logical rank of ``(thread, item)`` in a blocked arrangement."""
-    del block_threads
-    return thread * items_per_thread + item
-
-
-def _striped_rank(thread, item, block_threads, items_per_thread):
-    """Logical rank of ``(thread, item)`` in a block-striped arrangement."""
-    del items_per_thread
-    return thread + item * block_threads
-
-
-def _warp_striped_rank(thread, item, warp_threads, items_per_thread):
-    """Logical rank of ``(thread, item)`` in a warp-striped arrangement."""
-    warp_id, lane = divmod(thread, warp_threads)
-    return warp_id * warp_threads * items_per_thread + lane + item * warp_threads
 
 
 class _BlockExchangeMeta(type):
@@ -134,8 +120,6 @@ class BlockExchange(metaclass=_BlockExchangeMeta):
 
     @classmethod
     def blocked_layout(cls):
-        """Static ``(thread, item) -> logical rank`` blocked layout."""
-        cls._require_specialized()
         return make_layout(
             (cls.block_threads, cls.items_per_thread),
             (cls.items_per_thread, 1),
@@ -143,8 +127,6 @@ class BlockExchange(metaclass=_BlockExchangeMeta):
 
     @classmethod
     def striped_layout(cls):
-        """Static ``(thread, item) -> logical rank`` block-striped layout."""
-        cls._require_specialized()
         return make_layout(
             (cls.block_threads, cls.items_per_thread),
             (1, cls.block_threads),
@@ -152,8 +134,6 @@ class BlockExchange(metaclass=_BlockExchangeMeta):
 
     @classmethod
     def warp_striped_layout(cls):
-        """Static ``(warp, lane, item) -> logical rank`` warp-striped layout."""
-        cls._require_specialized()
         return make_layout(
             (cls.num_warps, cls.warp_threads, cls.items_per_thread),
             (cls.warp_threads * cls.items_per_thread, 1, cls.warp_threads),
@@ -162,7 +142,6 @@ class BlockExchange(metaclass=_BlockExchangeMeta):
     @classmethod
     def blocked_to_striped(cls, values, *, storage):
         """Redistribute a blocked arrangement across the whole block."""
-        cls._validate_values(values)
         tid = linear_thread_id(cls.block_size)
         source = cls.blocked_layout()
         destination = cls.striped_layout()
@@ -180,7 +159,6 @@ class BlockExchange(metaclass=_BlockExchangeMeta):
     @classmethod
     def striped_to_blocked(cls, values, *, storage):
         """Redistribute a block-striped arrangement back to blocked."""
-        cls._validate_values(values)
         tid = linear_thread_id(cls.block_size)
         source = cls.striped_layout()
         destination = cls.blocked_layout()
@@ -198,7 +176,6 @@ class BlockExchange(metaclass=_BlockExchangeMeta):
     @classmethod
     def blocked_to_warp_striped(cls, values, *, storage):
         """Redistribute blocked items independently inside each logical warp."""
-        cls._validate_values(values)
         tid = linear_thread_id(cls.block_size)
         warp_id = tid // cls.warp_threads
         lane = tid % cls.warp_threads
@@ -218,7 +195,6 @@ class BlockExchange(metaclass=_BlockExchangeMeta):
     @classmethod
     def warp_striped_to_blocked(cls, values, *, storage):
         """Redistribute warp-striped items back to block-wide blocked ownership."""
-        cls._validate_values(values)
         tid = linear_thread_id(cls.block_size)
         warp_id = tid // cls.warp_threads
         lane = tid % cls.warp_threads
@@ -237,22 +213,11 @@ class BlockExchange(metaclass=_BlockExchangeMeta):
 
     @classmethod
     def _storage_index(cls, logical_index):
+        """
+        Map a logical rank into the padded LDS buffer.
+        TODO: swizzling as an alternative?
+        """
         if cls.padding_items == 0:
             return logical_index
         period = _LDS_BANKS * cls.bank_items
         return logical_index + (logical_index // period) * cls.bank_items
-
-    @classmethod
-    def _require_specialized(cls):
-        if cls.block_threads is None:
-            raise TypeError("specialize first, e.g. BlockExchange[fx.Float32, 256, 4]")
-
-    @classmethod
-    def _validate_values(cls, values):
-        cls._require_specialized()
-        if not isinstance(values, Vector):
-            raise TypeError(f"values must be a Vector, got {type(values).__name__}")
-        if values.dtype is not cls.dtype:
-            raise TypeError(f"values dtype must be {cls.dtype.__name__}, got {values.dtype.__name__}")
-        if values.numel != cls.items_per_thread:
-            raise ValueError(f"values must contain {cls.items_per_thread} items per thread, got {values.numel}")
