@@ -3,10 +3,13 @@
 
 """Block-scope cooperative algorithms."""
 
+from .exchange import *
 from .reduce import *
 from .scan import *
 
 __all__ = [
+    # exchange
+    "BlockExchange",
     # reduce
     "BlockReduceAlgorithm",
     "BlockReduce",

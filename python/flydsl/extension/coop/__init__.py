@@ -15,6 +15,7 @@ Layout — one subpackage per scope, one module per algorithm::
     │   └── rocdl.py       ROCm overrides for the above
     └── block/
         ├── _spec.py       shared [...] specialization machinery
+        ├── exchange.py    BlockExchange
         ├── reduce.py      BlockReduce
         └── scan.py        BlockScan
 
@@ -40,6 +41,7 @@ __all__ = [
     "warp_scan",
     "warp_scan_with_aggregate",
     # block scope
+    "BlockExchange",
     "BlockReduceAlgorithm",
     "BlockReduce",
     "BlockScanAlgorithm",

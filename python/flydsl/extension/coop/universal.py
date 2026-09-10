@@ -24,6 +24,7 @@ callers want:
 
 from types import SimpleNamespace
 
+from .block import exchange as _block_exchange
 from .block import reduce as _block_reduce
 from .block import scan as _block_scan
 from .warp import reduce as _warp_reduce
@@ -37,6 +38,7 @@ __all__ = [
     "warp_scan",
     "warp_scan_with_aggregate",
     # block scope
+    "BlockExchange",
     "BlockReduceAlgorithm",
     "BlockReduce",
     "BlockScanAlgorithm",
@@ -63,6 +65,7 @@ _UNIVERSAL_WARP = SimpleNamespace(
 # The policy enums describe what an algorithm does, not how it is compiled, so
 # they are the dispatched ones rather than copies: a caller must be able to pass
 # ``fx.coop.BlockReduceAlgorithm.RAKING`` to either spelling of ``BlockReduce``.
+BlockExchange = _block_exchange.BlockExchange
 BlockReduceAlgorithm = _block_reduce.BlockReduceAlgorithm
 BlockScanAlgorithm = _block_scan.BlockScanAlgorithm
 
