@@ -9,6 +9,7 @@ Layout — one subpackage per scope, one module per algorithm::
     ├── _common.py     glue both scopes need
     ├── universal.py   the portable forms, dispatch turned off
     ├── warp/
+    │   ├── exchange.py  warp_permute
     │   ├── reduce.py      warp_reduce
     │   ├── scan.py        warp_inclusive_scan, warp_exclusive_scan, warp_scan,
     │   │                      warp_scan_with_aggregate
@@ -35,6 +36,7 @@ from .warp import *
 
 __all__ = [
     # warp scope
+    "warp_permute",
     "warp_reduce",
     "warp_inclusive_scan",
     "warp_exclusive_scan",

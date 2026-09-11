@@ -3,21 +3,26 @@
 
 """ROCDL overrides for the warp-scope collectives.
 
-Everything here is gfx9-only. ``row_bcast`` and ``wave_shr`` are CDNA DPP
-controls that RDNA dropped in favour of ``row_share`` / ``permlanex16``, which
-is a different sequence rather than a different constant -- and one with much
-less to gain, since LLVM's own rewrite already reaches pure DPP there.
+``warp_permute`` uses ``ds_bpermute`` across ROCm targets. The reduction and
+scan overrides below are gfx9-only: ``row_bcast`` and ``wave_shr`` are CDNA DPP
+controls that RDNA dropped in favour of ``row_share`` / ``permlanex16``. That
+requires a different sequence rather than a different constant, and has less
+to gain because LLVM's own rewrite already reaches pure DPP there.
 """
 
 from ....compiler.backends import current_target
 from ....expr.gpu import lane_id
-from ....expr.numeric import Int32, Numeric
-from ....expr.rocdl import ds_swizzle, readlane, update_dpp
+from ....expr.numeric import Int32, Numeric, Uint8, Uint16
+from ....expr.rocdl import ds_bpermute, ds_swizzle, readlane, update_dpp
+from ....expr.typing import Vector
 from .._common import combine, identity, resolve_warp_width, seed
 from . import scan as _universal_scan
+from .exchange import _absolute_source_lane
+from .exchange import warp_permute as _portable_warp_permute
 from .reduce import warp_reduce as _portable_warp_reduce
 
 __all__ = [
+    "warp_permute",
     "warp_reduce",
     "warp_inclusive_scan",
     "warp_exclusive_scan",
@@ -48,6 +53,40 @@ _BUTTERFLY_DPP = {1: 0xB1, 2: 0x4E, 4: 0x141, 8: 0x128}
 # ``((lane & and_mask) | or_mask) ^ xor_mask``, and the offset packs the three
 # as ``xor_mask << 10 | or_mask << 5 | and_mask``.
 _SWIZZLE_XOR16 = (16 << 10) | 0x1F
+
+
+def warp_permute(value, source_lane, *, width=None):
+    """ROCm lane permutation, packing the value into 32-bit VGPR chunks."""
+    width = resolve_warp_width(width, "warp_permute width")
+
+    is_vector = isinstance(value, Vector)
+    if is_vector:
+        values = value
+    elif isinstance(value, Numeric):
+        values = Vector.from_elements([value], type(value))
+    else:
+        raise TypeError(f"value must be a Numeric or Vector, got {type(value).__name__}")
+
+    total_bits = values.numel * values.dtype.width
+    if total_bits < 32:
+        packed_dtype = {8: Uint8, 16: Uint16}.get(total_bits)
+        if packed_dtype is None:
+            return _portable_warp_permute(value, source_lane, width=width)
+        source_lane = _absolute_source_lane(source_lane, width)
+        packed = values.bitcast(packed_dtype)[0].to(Int32)
+        moved = Int32(ds_bpermute(Int32.ir_type, source_lane * 4, packed.ir_value()))
+        result = Vector.from_elements([moved.to(packed_dtype)], packed_dtype).bitcast(values.dtype)
+    elif total_bits % 32 == 0:
+        source_lane = _absolute_source_lane(source_lane, width)
+        packed = values.bitcast(Int32)
+        result = Vector.from_elements(
+            [Int32(ds_bpermute(Int32.ir_type, source_lane * 4, word.ir_value())) for word in packed],
+            Int32,
+        ).bitcast(values.dtype)
+    else:
+        return _portable_warp_permute(value, source_lane, width=width)
+
+    return result if is_vector else result[0]
 
 
 def _swizzle_broadcast(width):

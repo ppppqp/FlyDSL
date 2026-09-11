@@ -147,7 +147,25 @@ def test_specialization_and_padding_metadata():
     assert exchange.padding_items == 16
     assert exchange.storage_items == 528
     assert exchange.SharedStorage.__dsl_field_defs__[0].type_spec.size == 528
-    assert fx.coop.universal.BlockExchange is fx.coop.BlockExchange
+    assert fx.coop.universal.BlockExchange is not fx.coop.BlockExchange
+    assert exchange.warp_ops.warp_permute is fx.coop.warp_permute
+    assert fx.coop.universal.BlockExchange.warp_ops.warp_permute is fx.coop.universal.warp_permute
+
+
+@pytest.mark.l1a_compile_no_target_dialect
+def test_static_planner_selects_the_narrowest_legal_scope():
+    register = fx.coop.BlockExchange[fx.Int32, 1, 4]
+    one_warp = fx.coop.BlockExchange[fx.Int32, WARP_SIZE, 4]
+    two_warps = fx.coop.BlockExchange[fx.Int32, 2 * WARP_SIZE, 4]
+
+    assert register._blocked_to_striped_lowering == "register"
+    assert register._blocked_to_warp_striped_lowering == "register"
+    assert one_warp._blocked_to_striped_lowering == "warp"
+    assert one_warp._blocked_to_warp_striped_lowering == "warp"
+    assert two_warps._blocked_to_striped_lowering == "lds"
+    assert two_warps._striped_to_blocked_lowering == "lds"
+    assert two_warps._blocked_to_warp_striped_lowering == "warp"
+    assert two_warps._warp_striped_to_blocked_lowering == "warp"
 
 
 @pytest.mark.l1a_compile_no_target_dialect
@@ -168,21 +186,52 @@ def test_invalid_specializations_are_rejected(params, error, message):
 
 @pytest.mark.l1a_compile_no_target_dialect
 @pytest.mark.parametrize(
-    "method",
+    "method, uses_lds",
     (
-        "blocked_to_striped",
-        "striped_to_blocked",
-        "blocked_to_warp_striped",
-        "warp_striped_to_blocked",
+        ("blocked_to_striped", True),
+        ("striped_to_blocked", True),
+        ("blocked_to_warp_striped", False),
+        ("warp_striped_to_blocked", False),
     ),
 )
-def test_every_exchange_path_traces_to_valid_frontend_ir(method, frontend_only_compile):
-    @flyc.kernel(known_block_size=[64, 1, 1])
+def test_every_exchange_path_traces_to_valid_frontend_ir(method, uses_lds, frontend_only_compile):
+    block_threads = 2 * WARP_SIZE
+
+    @flyc.kernel(known_block_size=[block_threads, 1, 1])
     def kernel():
-        exchange = fx.coop.BlockExchange[fx.Int32, 64, 4]
+        exchange = fx.coop.BlockExchange[fx.Int32, block_threads, 4]
         storage = fx.SharedAllocator().allocate(exchange.SharedStorage).peek()
         values = fx.Vector.from_elements([fx.Int32(i) for i in range(4)])
         getattr(exchange, method)(values, storage=storage)
+
+    @flyc.jit
+    def launch():
+        kernel().launch(grid=(1, 1, 1), block=(block_threads, 1, 1))
+
+    launch()
+    ir_text = launch._last_compiled[1].source_ir
+    assert ("gpu.barrier" in ir_text) is uses_lds
+    assert ("fly.make_layout" in ir_text) is uses_lds
+    assert ("rocdl.ds_bpermute" in ir_text) is not uses_lds
+    assert "vector.from_elements" in ir_text
+
+
+@pytest.mark.l1a_compile_no_target_dialect
+@pytest.mark.parametrize(
+    "dtype, items_per_lane, expected_moves",
+    (
+        (fx.Uint8, 1, 1),
+        (fx.Int16, 1, 1),
+        (fx.Int32, 1, 1),
+        (fx.Int64, 1, 2),
+        (fx.Float32, 4, 4),
+    ),
+)
+def test_rocm_warp_permute_packs_into_32_bit_moves(dtype, items_per_lane, expected_moves, frontend_only_compile):
+    @flyc.kernel(known_block_size=[64, 1, 1])
+    def kernel():
+        values = fx.Vector.from_elements([dtype(i) for i in range(items_per_lane)])
+        fx.coop.warp_permute(values, fx.lane_id() ^ 1)
 
     @flyc.jit
     def launch():
@@ -190,9 +239,24 @@ def test_every_exchange_path_traces_to_valid_frontend_ir(method, frontend_only_c
 
     launch()
     ir_text = launch._last_compiled[1].source_ir
-    assert "gpu.barrier" in ir_text
-    assert "fly.make_layout" in ir_text
-    assert "vector.from_elements" in ir_text
+    assert ir_text.count("rocdl.ds_bpermute") == expected_moves
+
+
+@pytest.mark.l1a_compile_no_target_dialect
+def test_universal_warp_permute_remains_portable(frontend_only_compile):
+    @flyc.kernel(known_block_size=[64, 1, 1])
+    def kernel():
+        values = fx.Vector.from_elements([fx.Int32(0), fx.Int32(1)])
+        fx.coop.universal.warp_permute(values, fx.lane_id() ^ 1)
+
+    @flyc.jit
+    def launch():
+        kernel().launch(grid=(1, 1, 1), block=(64, 1, 1))
+
+    launch()
+    ir_text = launch._last_compiled[1].source_ir
+    assert ir_text.count("gpu.shuffle") == 2
+    assert "rocdl.ds_bpermute" not in ir_text
 
 
 @pytest.mark.l1b_target_dialect
@@ -223,6 +287,37 @@ def test_exchange_lowers_through_the_pre_binary_pipeline(pre_binary_compile):
     assert "llvm.load" in lowered
     assert "gpu.barrier" not in lowered
     assert "fly.make_layout" not in lowered
+
+
+@pytest.mark.l1b_target_dialect
+@pytest.mark.rocm_lower
+@pytest.mark.skipif(torch is None, reason="requires torch tensor arguments")
+def test_wave_local_exchange_lowers_without_shared_memory(pre_binary_compile):
+    arch, lowered_modules = pre_binary_compile
+    warp_threads = RocmBackend.make_target(arch).warp_size
+    block_threads = 2 * warp_threads
+
+    @flyc.kernel(known_block_size=[block_threads, 1, 1])
+    def kernel(A: fx.Tensor, Out: fx.Tensor):
+        tid = fx.thread_idx.x
+        exchange = fx.coop.BlockExchange[fx.Int32, block_threads, 2]
+        values = fx.Vector.from_elements([A[tid * 2], A[tid * 2 + 1]])
+        values = exchange.blocked_to_warp_striped(values)
+        Out[tid * 2] = values[0]
+        Out[tid * 2 + 1] = values[1]
+
+    @flyc.jit
+    def launch(A: fx.Tensor, Out: fx.Tensor):
+        kernel(A, Out).launch(grid=(1, 1, 1), block=(block_threads, 1, 1))
+
+    data = torch.empty(block_threads * 2, dtype=torch.int32)
+    launch(data, torch.empty_like(data))
+
+    assert len(lowered_modules) == 1
+    lowered = lowered_modules[0]
+    assert f'chip = "{arch}"' in lowered
+    assert "bpermute" in lowered, [line for line in lowered.splitlines() if "permute" in line or "shuffle" in line]
+    assert "workgroup" not in lowered
 
 
 # ── actual device exchange ────────────────────────────────────────────────

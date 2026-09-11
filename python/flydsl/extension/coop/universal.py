@@ -27,11 +27,13 @@ from types import SimpleNamespace
 from .block import exchange as _block_exchange
 from .block import reduce as _block_reduce
 from .block import scan as _block_scan
+from .warp import exchange as _warp_exchange
 from .warp import reduce as _warp_reduce
 from .warp import scan as _warp_scan
 
 __all__ = [
     # warp scope
+    "warp_permute",
     "warp_reduce",
     "warp_inclusive_scan",
     "warp_exclusive_scan",
@@ -46,6 +48,7 @@ __all__ = [
 ]
 
 
+warp_permute = _warp_exchange.warp_permute
 warp_reduce = _warp_reduce.warp_reduce
 warp_inclusive_scan = _warp_scan.warp_inclusive_scan
 warp_exclusive_scan = _warp_scan.warp_exclusive_scan
@@ -65,9 +68,14 @@ _UNIVERSAL_WARP = SimpleNamespace(
 # The policy enums describe what an algorithm does, not how it is compiled, so
 # they are the dispatched ones rather than copies: a caller must be able to pass
 # ``fx.coop.BlockReduceAlgorithm.RAKING`` to either spelling of ``BlockReduce``.
-BlockExchange = _block_exchange.BlockExchange
 BlockReduceAlgorithm = _block_reduce.BlockReduceAlgorithm
 BlockScanAlgorithm = _block_scan.BlockScanAlgorithm
+
+
+class BlockExchange(_block_exchange.BlockExchange):
+    """:class:`~flydsl.extension.coop.BlockExchange`, using portable warp moves."""
+
+    warp_ops = _warp_exchange
 
 
 class BlockReduce(_block_reduce.BlockReduce):
