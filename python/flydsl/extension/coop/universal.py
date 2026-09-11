@@ -24,6 +24,7 @@ callers want:
 
 from types import SimpleNamespace
 
+from .block import BlockExchange as BlockExchange
 from .block import reduce as _block_reduce
 from .block import scan as _block_scan
 from .warp import reduce as _warp_reduce
@@ -41,6 +42,7 @@ __all__ = [
     "BlockReduce",
     "BlockScanAlgorithm",
     "BlockScan",
+    "BlockExchange",
 ]
 
 

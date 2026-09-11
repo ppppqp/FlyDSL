@@ -16,7 +16,8 @@ Layout — one subpackage per scope, one module per algorithm::
     └── block/
         ├── _spec.py       shared [...] specialization machinery
         ├── reduce.py      BlockReduce
-        └── scan.py        BlockScan
+        ├── scan.py        BlockScan
+        └── exchange.py    BlockExchange
 
 That surface is flat — ``fx.coop.<name>`` — so callers never spell the scope
 out twice (``fx.coop.warp_reduce``, not ``fx.coop.warp.warp_reduce``).
@@ -44,4 +45,5 @@ __all__ = [
     "BlockReduce",
     "BlockScanAlgorithm",
     "BlockScan",
+    "BlockExchange",
 ]
