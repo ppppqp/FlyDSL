@@ -39,7 +39,6 @@ KV cache layouts:
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, range_constexpr
-from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from kernels.common import buffer_ops
@@ -123,7 +122,6 @@ def build_fused_rope_cache_module(
         pid_t = fx.block_idx.y
         tid = fx.thread_idx.x
 
-        elem_type = T.bf16 if dtype_str == "bf16" else T.f16
         elem_dtype = fx.BFloat16 if dtype_str == "bf16" else fx.Float16
 
         # --- Layout API setup ---
@@ -148,36 +146,6 @@ def build_fused_rope_cache_module(
             fx.memref_store_vec(val, r)
             fx.copy(atom or copy_atom, r, fx.slice(div_tensor, (None, idx)))
 
-        # Helper: get the rotary-pair element via ds_bpermute (LDS cross-lane shuffle).
-        # For NeoX RoPE, the pair of thread tid is tid XOR vecs_per_half.
-        # ds_bpermute: thread tid reads the VGPR value held by thread (pair_byte_addr/4).
-        # pair_byte_addr = (tid XOR vecs_per_half) * 4.
-        # Handles VEC_WIDTH=1 (vector<1xbf16/f16>, 16-bit) and VEC_WIDTH=2 (vector<2xbf16/f16>, 32-bit).
-        def ds_bpermute_pair(vec_val, pair_byte_addr):
-            """Return the copy of vec_val held by the rotary-pair thread, via ds_bpermute."""
-            if const_expr(VEC_WIDTH == 1):
-                # vector<1xf16/bf16> → extract scalar → bitcast to i16 → zero-extend i32
-                elem_val = vec_val[0]
-                i16_val = ArithValue(elem_val).bitcast(T.i16)
-                i32_val = ArithValue(i16_val).extui(T.i32)
-                # Cross-lane shuffle: get pair thread's 32-bit VGPR (pair elem in low 16 bits)
-                peer_i32 = fx.rocdl.ds_bpermute(T.i32, pair_byte_addr, i32_val)
-                # Truncate back to i16, bitcast to elem_type, reconstruct vector<1xelem_type>
-                peer_i16 = ArithValue(peer_i32).trunci(T.i16)
-                peer_elem = ArithValue(peer_i16).bitcast(elem_type)
-                return Vec.from_elements([peer_elem], elem_dtype)
-            else:
-                # VEC_WIDTH>=2: VEC_WIDTH bf16/f16 elements → n_i32 x i32, one ds_bpermute per chunk.
-                # VEC_WIDTH=2 → n_i32=1 (32 bits); VEC_WIDTH=4 → n_i32=2 (64 bits), etc.
-                n_i32 = VEC_WIDTH // 2
-                v_i32 = Vec(vec_val).bitcast(fx.Int32)
-                peer_chunks = []
-                for ci in range_constexpr(n_i32):
-                    chunk = v_i32[ci]
-                    peer_chunks.append(fx.rocdl.ds_bpermute(T.i32, pair_byte_addr, chunk))
-                peer_v_i32 = Vec.from_elements(peer_chunks, fx.Int32)
-                return peer_v_i32.bitcast(elem_dtype)
-
         if tid < vecs_per_head:
             # --- Load position (scalar i32) ---
             pos_rsrc = buffer_ops.create_buffer_resource(Positions, max_size=True)
@@ -189,11 +157,6 @@ def build_fused_rope_cache_module(
 
             is_first_half = tid < vecs_per_half
             cos_vec_idx = tid % vecs_per_half if reuse_freqs_front_part else tid
-
-            # Pair lane for ds_bpermute: tid XOR vecs_per_half (symmetric, works for both halves).
-            # pair_byte_addr = pair_lane * 4 (ds_bpermute address unit is bytes, VGPR = 4 bytes).
-            pair_lane = tid ^ vecs_per_half
-            pair_byte_addr = pair_lane * 4
 
             # --- Shared cos/sin (loaded once, used by both Q and K) ---
             Cos_buf = fx.rocdl.make_buffer_tensor(CosCache)
@@ -217,8 +180,8 @@ def build_fused_rope_cache_module(
 
                 q_e_vec = load_vec(q_div, tid)
                 q_e = q_e_vec
-                # Use ds_bpermute to get pair element via LDS cross-lane shuffle (no VMEM).
-                q_pair_e = ds_bpermute_pair(q_e_vec, pair_byte_addr)
+                # Read the packed register vector held by the rotary-pair lane.
+                q_pair_e = fx.coop.warp_permute_xor(q_e_vec, vecs_per_half)
 
                 q_cos = q_e * cos_e
                 q_pair_sin = q_pair_e * sin_e
@@ -239,8 +202,8 @@ def build_fused_rope_cache_module(
 
                 k_e_vec = load_vec(k_div, tid)
                 k_e = k_e_vec
-                # Use ds_bpermute to get pair element via LDS cross-lane shuffle (no VMEM).
-                k_pair_e = ds_bpermute_pair(k_e_vec, pair_byte_addr)
+                # Read the packed register vector held by the rotary-pair lane.
+                k_pair_e = fx.coop.warp_permute_xor(k_e_vec, vecs_per_half)
 
                 k_cos = k_e * cos_e
                 k_pair_sin = k_pair_e * sin_e

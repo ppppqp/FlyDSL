@@ -8,6 +8,7 @@ from .bitonic_sort import *
 from .exchange import *
 from .load import *
 from .merge_sort import *
+from .permute import *
 from .reduce import *
 from .reduce import WarpReduce as _WarpReduce
 from .reduce_batched import *
@@ -36,6 +37,8 @@ __all__ = [
     "warp_merge_sort",
     "warp_reduce",
     "warp_reduce_batched",
+    "warp_permute",
+    "warp_permute_xor",
     "warp_inclusive_scan",
     "warp_exclusive_scan",
     "warp_scan",

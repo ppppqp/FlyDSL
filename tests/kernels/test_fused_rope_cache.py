@@ -870,3 +870,15 @@ if __name__ == "__main__":
     else:
         print(f"{failures} TESTS FAILED")
         sys.exit(1)
+
+
+@pytest.mark.l2_device
+@pytest.mark.rocm_lower
+@pytest.mark.parametrize("head_dim", (16, 32, 64, 128, 256))
+@pytest.mark.parametrize("dtype_str", ("bf16", "f16"))
+def test_rotary_pair_vector_widths(head_dim, dtype_str):
+    """Partial waves, single narrow values, and multiple packed lane words."""
+    passed, errors = run_test(
+        num_tokens=32, head_dim=head_dim, num_q_heads=8, num_kv_heads=1, dtype_str=dtype_str, flash_layout=True
+    )
+    assert passed, errors

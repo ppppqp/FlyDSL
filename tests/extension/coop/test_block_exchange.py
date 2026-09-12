@@ -36,18 +36,19 @@ except ImportError:
     torch = None
 
 
-CONVERSIONS = ("blocked_to_striped", "striped_to_blocked", "blocked_to_warp_striped")
+CONVERSIONS = ("blocked_to_striped", "striped_to_blocked", "blocked_to_warp_striped", "warp_striped_to_blocked")
 EXCHANGE_DTYPES = (*DTYPES, (fx.Float16, "torch.float16"))
 BLOCK_SHAPES = ((64, 1, 1), (128, 1, 1), (256, 1, 1), (64, 2, 2))
 
 
-def run_block_exchange(values, dtype, *, block_size, items_per_thread, conversion):
+def run_block_exchange(values, dtype, *, block_size, items_per_thread, conversion, universal=False, no_storage=False):
     """Exchange *values* once per thread; return the result on the host."""
 
     @flyc.kernel(known_block_size=list(block_size))
     def kernel(A: fx.Tensor, Out: fx.Tensor):
-        exchange = fx.coop.BlockExchange[dtype, block_size, items_per_thread]
-        storage = fx.SharedAllocator().allocate(exchange.SharedStorage).peek()
+        namespace = fx.coop.universal if universal else fx.coop
+        exchange = namespace.BlockExchange[dtype, block_size, items_per_thread]
+        storage = None if no_storage else fx.SharedAllocator().allocate(exchange.SharedStorage).peek()
         tid = linear_tid(block_size)
         base = tid * items_per_thread
         items = fx.Vector.from_elements([A[base + i] for i in range(items_per_thread)], dtype)
@@ -74,7 +75,10 @@ def check_exchange(values, out, *, block_threads, items_per_thread, conversion):
         expected = host.reshape(block_threads, items_per_thread).T.flatten()
     else:
         width = min(WARP_SIZE, block_threads)
-        expected = host.reshape(-1, items_per_thread, width).transpose(1, 2).flatten()
+        if conversion == "blocked_to_warp_striped":
+            expected = host.reshape(-1, items_per_thread, width).transpose(1, 2).flatten()
+        else:
+            expected = host.reshape(-1, width, items_per_thread).transpose(1, 2).flatten()
     assert torch.equal(out, expected)
 
 
@@ -195,7 +199,7 @@ def test_invalid_specializations(params):
 def test_value_diagnostics(ctx, insert_point):
     exchange = fx.coop.BlockExchange[fx.Int32, 64, 4]
     assert exchange is fx.coop.BlockExchange[fx.Int32, (64, 1, 1), 4]
-    assert fx.coop.universal.BlockExchange is fx.coop.BlockExchange
+    assert issubclass(fx.coop.universal.BlockExchange, fx.coop.BlockExchange)
     with pytest.raises(TypeError, match="already specialized"):
         exchange[fx.Int32, 64, 4]
     with pytest.raises(TypeError, match="specialize first"):
@@ -213,3 +217,35 @@ def test_value_diagnostics(ctx, insert_point):
         exchange.blocked_to_striped(values.reshape((2, 2)), storage=None)
     with pytest.raises(TypeError, match="requires SharedStorage"):
         exchange.blocked_to_striped(values, storage=None)
+
+
+@pytest.mark.l2_device
+@pytest.mark.rocm_lower
+@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires GPU")
+@pytest.mark.parametrize("conversion", CONVERSIONS)
+@pytest.mark.parametrize("block_threads", (1, WARP_SIZE // 2, WARP_SIZE))
+@pytest.mark.parametrize("universal", (False, True))
+def test_wave_local_exchange_needs_no_storage(conversion, block_threads, universal):
+    values = sample("torch.int32", block_threads * 4)
+    out = run_block_exchange(
+        values,
+        fx.Int32,
+        block_size=(block_threads, 1, 1),
+        items_per_thread=4,
+        conversion=conversion,
+        universal=universal,
+        no_storage=True,
+    )
+    check_exchange(values, out, block_threads=block_threads, items_per_thread=4, conversion=conversion)
+
+
+@pytest.mark.l2_device
+@pytest.mark.rocm_lower
+@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires GPU")
+@pytest.mark.parametrize("conversion", ("blocked_to_warp_striped", "warp_striped_to_blocked"))
+def test_warp_striping_in_multiple_waves_needs_no_storage(conversion):
+    values = sample("torch.int32", 256 * 4)
+    out = run_block_exchange(
+        values, fx.Int32, block_size=(64, 2, 2), items_per_thread=4, conversion=conversion, no_storage=True
+    )
+    check_exchange(values, out, block_threads=256, items_per_thread=4, conversion=conversion)

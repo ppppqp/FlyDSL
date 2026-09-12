@@ -15,12 +15,14 @@ implementation selection and comparison in correctness tests and benchmarks.
 
 from types import SimpleNamespace
 
+
 from . import block as _block
 from . import warp as _warp
 from .block import reduce as _block_reduce
 from .block import scan as _block_scan
 from .warp import reduce as _warp_reduce
 from .warp import scan as _warp_scan
+from .warp import permute as _warp_permute
 from .warp.bitonic_sort import *
 from .warp.exchange import *
 from .warp.load import *
@@ -39,6 +41,7 @@ warp_inclusive_scan = _warp_scan.warp_inclusive_scan
 warp_exclusive_scan = _warp_scan.warp_exclusive_scan
 warp_scan = _warp_scan.warp_scan
 warp_scan_with_aggregate = _warp_scan.warp_scan_with_aggregate
+warp_permute = _warp_permute.warp_permute
 
 
 # What the block classes below fold through, in place of the dispatched warp
@@ -47,6 +50,7 @@ warp_scan_with_aggregate = _warp_scan.warp_scan_with_aggregate
 _UNIVERSAL_WARP = SimpleNamespace(
     warp_reduce=warp_reduce,
     warp_inclusive_scan=warp_inclusive_scan,
+    warp_permute=warp_permute,
     warp_scan_with_aggregate=warp_scan_with_aggregate,
 )
 
