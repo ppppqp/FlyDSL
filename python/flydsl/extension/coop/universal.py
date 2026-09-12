@@ -24,15 +24,19 @@ callers want:
 
 from types import SimpleNamespace
 
-from .block import BlockExchange as BlockExchange
+from .block import exchange as _block_exchange
 from .block import reduce as _block_reduce
 from .block import scan as _block_scan
 from .warp import reduce as _warp_reduce
 from .warp import scan as _warp_scan
+from .warp.permute import warp_permute as warp_permute
+from .warp.permute import warp_permute_xor as warp_permute_xor
 
 __all__ = [
     # warp scope
     "warp_reduce",
+    "warp_permute",
+    "warp_permute_xor",
     "warp_inclusive_scan",
     "warp_exclusive_scan",
     "warp_scan",
@@ -58,6 +62,7 @@ warp_scan_with_aggregate = _warp_scan.warp_scan_with_aggregate
 # warp primitive that gains a block-scope caller has to be added deliberately.
 _UNIVERSAL_WARP = SimpleNamespace(
     warp_reduce=warp_reduce,
+    warp_permute=warp_permute,
     warp_scan_with_aggregate=warp_scan_with_aggregate,
 )
 
@@ -77,5 +82,11 @@ class BlockReduce(_block_reduce.BlockReduce):
 
 class BlockScan(_block_scan.BlockScan):
     """:class:`~flydsl.extension.coop.BlockScan`, folding through portable warps."""
+
+    warp_ops = _UNIVERSAL_WARP
+
+
+class BlockExchange(_block_exchange.BlockExchange):
+    """:class:`~flydsl.extension.coop.BlockExchange`, using portable lane moves."""
 
     warp_ops = _UNIVERSAL_WARP

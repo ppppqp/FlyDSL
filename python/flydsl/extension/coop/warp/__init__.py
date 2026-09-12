@@ -4,11 +4,14 @@
 """Warp-scope cooperative algorithms."""
 
 from ..._dispatch import Dispatcher
+from .permute import *
 from .reduce import *
 from .scan import *
 
 __all__ = [
     "warp_reduce",
+    "warp_permute",
+    "warp_permute_xor",
     "warp_inclusive_scan",
     "warp_exclusive_scan",
     "warp_scan",

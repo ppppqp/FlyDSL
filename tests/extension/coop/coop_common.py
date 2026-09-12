@@ -63,6 +63,7 @@ _TORCH_OF = {
     "torch.int32": "int32",
     "torch.int64": "int64",
     "torch.float16": "float16",
+    "torch.bfloat16": "bfloat16",
     "torch.float32": "float32",
     "torch.float64": "float64",
 }

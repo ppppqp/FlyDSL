@@ -36,6 +36,8 @@ from .warp import *
 __all__ = [
     # warp scope
     "warp_reduce",
+    "warp_permute",
+    "warp_permute_xor",
     "warp_inclusive_scan",
     "warp_exclusive_scan",
     "warp_scan",

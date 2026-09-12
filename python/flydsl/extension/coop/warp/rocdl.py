@@ -3,7 +3,7 @@
 
 """ROCDL overrides for the warp-scope collectives.
 
-Everything here is gfx9-only. ``row_bcast`` and ``wave_shr`` are CDNA DPP
+The reduction and scan optimizations here are gfx9-only. ``row_bcast`` and ``wave_shr`` are CDNA DPP
 controls that RDNA dropped in favour of ``row_share`` / ``permlanex16``, which
 is a different sequence rather than a different constant -- and one with much
 less to gain, since LLVM's own rewrite already reaches pure DPP there.
@@ -12,13 +12,16 @@ less to gain, since LLVM's own rewrite already reaches pure DPP there.
 from ....compiler.backends import current_target
 from ....expr.gpu import lane_id
 from ....expr.numeric import Int32, Numeric
-from ....expr.rocdl import ds_swizzle, readlane, update_dpp
+from ....expr.rocdl import ds_bpermute, ds_swizzle, readlane, update_dpp
 from .._common import combine, identity, resolve_warp_width, seed
 from . import scan as _universal_scan
+from .permute import _permute
 from .reduce import warp_reduce as _portable_warp_reduce
 
 __all__ = [
     "warp_reduce",
+    "warp_permute",
+    "warp_permute_xor",
     "warp_inclusive_scan",
     "warp_exclusive_scan",
     "warp_scan",
@@ -297,3 +300,25 @@ def warp_scan_with_aggregate(value, op, *, width=None, init=None):
     inclusive = seed(raw, op, init)
     exclusive = seed(_shift_up(raw, op, width), op, init)
     return inclusive, exclusive, _aggregate(raw, width)
+
+
+def _bpermute_word(word, source):
+    return Int32(ds_bpermute(Int32.ir_type, source * 4, word))
+
+
+def warp_permute(value, source_lane, *, width=None):
+    """Packed AMD lane permutation; same contract as the portable form."""
+    return _permute(value, source_lane, width, _bpermute_word)
+
+
+def _xor_permute_word(word, mask):
+    # Bit mode permutes independently inside 32-lane groups on both CDNA
+    # and RDNA. Crossing wave64's halves needs an explicitly addressed move.
+    if mask < 32:
+        return _swizzle(word, (mask << 10) | 0x1F)
+    return _bpermute_word(word, lane_id() ^ mask)
+
+
+def warp_permute_xor(value, lane_mask, *, width=None):
+    """Packed XOR permutation using a constant swizzle when possible."""
+    return _permute(value, lane_mask, width, _xor_permute_word, xor=True)

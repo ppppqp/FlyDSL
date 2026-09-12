@@ -8,6 +8,7 @@ from ....expr.numeric import Numeric
 from ....expr.primitive import get_scalar, make_layout
 from ....expr.struct import Struct
 from ....expr.typing import Array, Vector
+from .. import warp as _dispatched_warp
 from .._common import linear_thread_id, require_power_of_two
 from ._spec import _block_shape
 
@@ -82,7 +83,7 @@ class _BlockExchangeMeta(type):
 
 
 class BlockExchange(metaclass=_BlockExchangeMeta):
-    """Redistribute a block's register tile through padded shared memory.
+    """Redistribute a register tile using lane moves or padded shared memory.
 
     Usage::
 
@@ -101,8 +102,10 @@ class BlockExchange(metaclass=_BlockExchangeMeta):
     than a hardware wave uses its block size as the logical warp width.
 
     All threads must reach the call together, with the specialized launch
-    shape. Each call performs one block barrier between stores and loads.
-    Insert a barrier before reusing storage, including for an inverse exchange.
+    shape. Identity conversions stay in registers. Wave-local conversions use
+    packed lane moves and need no storage. Cross-wave conversions require
+    SharedStorage and one block barrier between stores and loads; insert a
+    barrier before reusing that storage, including for an inverse exchange.
     Padding reduces bank conflicts for common arrangements but is not a
     target-independent guarantee of conflict-free accesses.
     """
@@ -114,19 +117,20 @@ class BlockExchange(metaclass=_BlockExchangeMeta):
     warp_threads = None
     storage_items = None
     SharedStorage = None
+    warp_ops = _dispatched_warp
 
     @classmethod
-    def blocked_to_striped(cls, values, *, storage):
+    def blocked_to_striped(cls, values, *, storage=None):
         """Convert blocked ownership to striping across the block."""
         return cls._exchange(values, "blocked", "striped", storage)
 
     @classmethod
-    def striped_to_blocked(cls, values, *, storage):
+    def striped_to_blocked(cls, values, *, storage=None):
         """Convert block-striped ownership back to blocked ownership."""
         return cls._exchange(values, "striped", "blocked", storage)
 
     @classmethod
-    def blocked_to_warp_striped(cls, values, *, storage):
+    def blocked_to_warp_striped(cls, values, *, storage=None):
         """Stripe each logical warp's contiguous tile independently."""
         return cls._exchange(values, "blocked", "warp_striped", storage)
 
@@ -144,8 +148,14 @@ class BlockExchange(metaclass=_BlockExchangeMeta):
             raise TypeError(f"BlockExchange expects {cls.dtype.__name__} values")
         if values.shape != (cls.items_per_thread,):
             raise ValueError(f"BlockExchange expects a flat Vector of {cls.items_per_thread} items")
+        # The named layouts are bijective. Their widest ownership movement
+        # determines the lowering without enumerating the block's elements.
+        if cls.items_per_thread == 1 or cls.block_threads == 1:
+            return values
+        if cls.block_threads == cls.warp_threads or "warp_striped" in (source, destination):
+            return cls._exchange_warp(values, source, destination)
         if storage is None:
-            raise TypeError("BlockExchange requires SharedStorage")
+            raise TypeError("cross-wave BlockExchange requires SharedStorage")
         tid = linear_thread_id(cls.block_size)
         src = make_layout(*_layout_spec(source, cls.block_threads, cls.items_per_thread, cls.warp_threads))
         dst = make_layout(*_layout_spec(destination, cls.block_threads, cls.items_per_thread, cls.warp_threads))
@@ -158,3 +168,23 @@ class BlockExchange(metaclass=_BlockExchangeMeta):
             [storage.buffer[cls._storage_index(get_scalar(dst(tid, i)))] for i in range(cls.items_per_thread)],
             cls.dtype,
         )
+
+    @classmethod
+    def warp_striped_to_blocked(cls, values, *, storage=None):
+        """Undo warp striping independently inside each logical warp."""
+        return cls._exchange(values, "warp_striped", "blocked", storage)
+
+    @classmethod
+    def _exchange_warp(cls, values, source, destination):
+        lane = linear_thread_id(cls.block_size) % cls.warp_threads
+        outputs = []
+        for item in range(cls.items_per_thread):
+            # Within a wave, both striped arrangements have the same ranks.
+            rank = lane * cls.items_per_thread + item if destination == "blocked" else lane + item * cls.warp_threads
+            if source == "blocked":
+                source_lane, source_item = rank // cls.items_per_thread, rank % cls.items_per_thread
+            else:
+                source_lane, source_item = rank % cls.warp_threads, rank // cls.warp_threads
+            peer = cls.warp_ops.warp_permute(values, source_lane, width=cls.warp_threads)
+            outputs.append(peer[source_item])
+        return Vector.from_elements(outputs, cls.dtype)
