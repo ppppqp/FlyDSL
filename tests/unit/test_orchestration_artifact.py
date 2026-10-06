@@ -8,7 +8,13 @@ import pickle
 import pytest
 
 from flydsl._mlir import ir
-from flydsl.compiler.jit_executor import CompiledArtifact
+from flydsl.compiler.jit_executor import (
+    CompiledArtifact,
+    KernelLaunch,
+    LaunchPlan,
+    LaunchPlanError,
+    extract_launch_plan,
+)
 from flydsl.compiler.jit_function import _create_mlir_context
 
 pytestmark = [pytest.mark.l0_backend_agnostic]
@@ -53,6 +59,25 @@ def test_orchestration_metadata_survives_disk_cache_round_trip():
     assert exported.device_objects == ()
 
 
+def test_launch_plan_survives_disk_cache_round_trip():
+    artifact = CompiledArtifact(
+        _Module(),
+        "launch",
+        "module { gpu.launch_func @kernels::@kernel }",
+        backend="rocm",
+        target="gfx942",
+        kernel_abi="rocm.bare_ptr",
+        launch_plan=LaunchPlan(
+            host_entry="launch",
+            launches=(KernelLaunch(0, "@kernels::@kernel", (1, 1, 1), (64, 1, 1), 0, (), ()),),
+        ),
+    )
+
+    exported = pickle.loads(pickle.dumps(artifact)).export_for_orchestration()
+    assert exported.launch_plan is not None
+    assert exported.launch_plan.launches[0].block == (64, 1, 1)
+
+
 def test_device_objects_are_copied_out_of_the_producing_mlir_runtime():
     context = _create_mlir_context()
     with context:
@@ -81,3 +106,61 @@ def test_legacy_artifact_requires_recompilation():
 
     with pytest.raises(RuntimeError, match="recompile"):
         artifact.export_for_orchestration()
+
+
+def _parse_launch_module(body):
+    return ir.Module.parse(f"""module attributes {{gpu.container_module}} {{
+          gpu.module @kernels {{
+            gpu.func @stage(%arg0: !fly.ptr<f32, global>, %arg1: i32) kernel {{ gpu.return }}
+          }}
+          func.func @launch(%arg0: !fly.ptr<f32, global>, %arg1: i32) {{
+            %c1 = arith.constant 1 : index
+            %c64 = arith.constant 64 : index
+            {body}
+            return
+          }}
+        }}""")
+
+
+def test_extracts_restricted_straight_line_launch_plan():
+    context = _create_mlir_context()
+    with context:
+        module = _parse_launch_module("""gpu.launch_func @kernels::@stage
+                 blocks in (%c1, %c1, %c1) threads in (%c64, %c1, %c1)
+                 args(%arg0 : !fly.ptr<f32, global>, %arg1 : i32)
+               gpu.launch_func @kernels::@stage
+                 blocks in (%c1, %c1, %c1) threads in (%c64, %c1, %c1)
+                 args(%arg0 : !fly.ptr<f32, global>, %arg1 : i32)""")
+        plan = extract_launch_plan(module, "launch", ("output", "count"))
+
+    assert len(plan.launches) == 2
+    assert plan.launches[0].kernel == "@kernels::@stage"
+    assert plan.launches[0].block == (64, 1, 1)
+    assert plan.launches[0].arguments[0].kind == "resource"
+    assert plan.launches[0].arguments[0].binding == "output"
+    assert plan.launches[0].arguments[1].kind == "scalar"
+    assert plan.launches[1].dependencies == (0,)
+
+
+def test_rejects_launch_nested_in_control_flow():
+    context = _create_mlir_context()
+    with context:
+        module = _parse_launch_module("""%condition = arith.constant true
+               scf.if %condition {
+                 gpu.launch_func @kernels::@stage
+                   blocks in (%c1, %c1, %c1) threads in (%c64, %c1, %c1)
+                   args(%arg0 : !fly.ptr<f32, global>, %arg1 : i32)
+               }""")
+        with pytest.raises(LaunchPlanError, match="control flow"):
+            extract_launch_plan(module, "launch", ("output", "count"))
+
+
+def test_rejects_computed_kernel_argument():
+    context = _create_mlir_context()
+    with context:
+        module = _parse_launch_module("""%computed = arith.addi %arg1, %arg1 : i32
+               gpu.launch_func @kernels::@stage
+                 blocks in (%c1, %c1, %c1) threads in (%c64, %c1, %c1)
+                 args(%arg0 : !fly.ptr<f32, global>, %computed : i32)""")
+        with pytest.raises(LaunchPlanError, match="view-derived"):
+            extract_launch_plan(module, "launch", ("output", "count"))

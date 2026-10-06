@@ -36,7 +36,7 @@ from .diagnostics import (
     warn_invalid_annotations,
 )
 from .jit_argument import convert_to_jit_arguments, is_type_param_annotation, resolve_signature
-from .jit_executor import CallState, CompiledArtifact
+from .jit_executor import CallState, CompiledArtifact, LaunchPlanError, extract_launch_plan
 from .kernel_function import (
     CompilationContext,
     KernelFunction,
@@ -1543,6 +1543,22 @@ class JitFunction:
 
                     original_ir = module.operation.get_asm(enable_debug_info=True)
 
+                    binding_names = []
+                    for parameter_name, jit_argument in zip(param_names, user_jit_args):
+                        physical_count = len(get_ir_types(jit_argument))
+                        binding_names.extend(
+                            [parameter_name]
+                            if physical_count == 1
+                            else [f"{parameter_name}.{index}" for index in range(physical_count)]
+                        )
+                    binding_names.extend(f"__implicit.{index}" for index in range(len(ir_args) - len(binding_names)))
+                    try:
+                        launch_plan = extract_launch_plan(module, self.func.__name__, binding_names)
+                        launch_plan_error = None
+                    except LaunchPlanError as error:
+                        launch_plan = None
+                        launch_plan_error = str(error)
+
                     # Extern-symbol integration is carried entirely via
                     # CompilationContext: each ExternFunction populates
                     # link_libs and post_load_processors at declaration time,
@@ -1583,6 +1599,8 @@ class JitFunction:
                         backend=backend.target.backend,
                         target=backend.target.arch,
                         kernel_abi=backend.orchestration_kernel_abi(),
+                        launch_plan=launch_plan,
+                        launch_plan_error=launch_plan_error,
                     )
 
                     # Always keep a reference to the latest compilation result so

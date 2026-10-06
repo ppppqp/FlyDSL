@@ -9,7 +9,7 @@ import zlib
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Union
 
 from .._mlir import ir
 from .._mlir.execution_engine import ExecutionEngine
@@ -23,6 +23,38 @@ class DeviceObject:
     data: bytes
     format: int
     target: str
+
+
+@dataclass(frozen=True)
+class LaunchArgument:
+    """One physical device-kernel argument in a producer-side launch plan."""
+
+    logical_index: int
+    kind: str
+    source_type: str
+    binding: Optional[str] = None
+    value: Optional[Union[int, float]] = None
+
+
+@dataclass(frozen=True)
+class KernelLaunch:
+    """Restricted, runtime-independent description of one GPU launch."""
+
+    id: int
+    kernel: str
+    grid: tuple[int, int, int]
+    block: tuple[int, int, int]
+    shared_memory: int
+    arguments: tuple[LaunchArgument, ...]
+    dependencies: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class LaunchPlan:
+    """A verified straight-line launch region exported by FlyDSL."""
+
+    host_entry: str
+    launches: tuple[KernelLaunch, ...]
 
 
 @dataclass(frozen=True)
@@ -41,6 +73,162 @@ class OrchestrationArtifact:
     target: str
     kernel_abi: str
     device_objects: tuple[DeviceObject, ...]
+    launch_plan: Optional[LaunchPlan] = None
+    launch_plan_error: Optional[str] = None
+
+
+class LaunchPlanError(ValueError):
+    """Raised when source IR cannot be represented by the restricted plan ABI."""
+
+
+def _operation_name(operation) -> str:
+    generic_operation = getattr(operation, "operation", operation)
+    return generic_operation.name
+
+
+def _constant_number(value, description: str) -> Union[int, float]:
+    owner = value.owner
+    if not hasattr(owner, "name") or _operation_name(owner) != "arith.constant":
+        raise LaunchPlanError(f"{description} must be an arith.constant")
+    attribute = owner.attributes["value"]
+    if isinstance(attribute, ir.IntegerAttr):
+        return int(attribute)
+    if isinstance(attribute, ir.FloatAttr):
+        return float(attribute.value)
+    raise LaunchPlanError(f"{description} has unsupported constant type {value.type}")
+
+
+def _constant_int(value, description: str) -> int:
+    result = _constant_number(value, description)
+    if not isinstance(result, int):
+        raise LaunchPlanError(f"{description} must be an integer")
+    return result
+
+
+def _walk_operations(operation):
+    for region in operation.regions:
+        for block in region.blocks:
+            for child in block.operations:
+                yield child
+                yield from _walk_operations(child)
+
+
+def _extract_launch_argument(value, logical_index: int, entry_block, bindings) -> LaunchArgument:
+    source_type = str(value.type)
+    owner = value.owner
+    if owner == entry_block:
+        name = value.get_name()
+        try:
+            binding = bindings[name]
+        except KeyError as exc:
+            raise LaunchPlanError(f"kernel argument {logical_index} is not a named host argument") from exc
+        if source_type.startswith("!fly.ptr<"):
+            if "global" not in source_type:
+                raise LaunchPlanError(f"kernel argument {logical_index} uses non-global pointer type {source_type}")
+            return LaunchArgument(logical_index, "resource", source_type, binding=binding)
+        if source_type.startswith("!fly.memref<") or source_type.startswith("memref<"):
+            raise LaunchPlanError(
+                f"kernel argument {logical_index} uses {source_type}; memref ABI expansion is not yet supported"
+            )
+        if source_type in {"i32", "i64", "f32", "f64"}:
+            return LaunchArgument(logical_index, "scalar", source_type, binding=binding)
+        raise LaunchPlanError(f"kernel argument {logical_index} has unsupported type {source_type}")
+
+    if hasattr(owner, "name") and _operation_name(owner) == "arith.constant":
+        if source_type not in {"i32", "i64", "f32", "f64"}:
+            raise LaunchPlanError(f"kernel argument {logical_index} has unsupported constant type {source_type}")
+        return LaunchArgument(
+            logical_index,
+            "constant",
+            source_type,
+            value=_constant_number(value, f"kernel argument {logical_index}"),
+        )
+    raise LaunchPlanError(
+        f"kernel argument {logical_index} is computed or view-derived; only direct host arguments and constants "
+        "are supported"
+    )
+
+
+def extract_launch_plan(module, host_entry: str, binding_names) -> LaunchPlan:
+    """Extract a conservative straight-line plan while FlyDSL owns the MLIR module.
+
+    The source-order dependency chain deliberately preserves sequential host-launch
+    semantics. Effect-derived dependency removal belongs in CKL after producer
+    interfaces expose sufficient memory effects.
+    """
+    host_operation = None
+    for operation in module.body.operations:
+        if _operation_name(operation) != "func.func":
+            continue
+        symbol = ir.StringAttr(operation.attributes["sym_name"]).value
+        if symbol == host_entry:
+            host_operation = operation
+            break
+    if host_operation is None:
+        raise LaunchPlanError(f"host entry @{host_entry} was not found")
+    if len(host_operation.regions[0].blocks) != 1:
+        raise LaunchPlanError("host entry must have one block")
+
+    entry_block = host_operation.regions[0].blocks[0]
+    if len(entry_block.arguments) != len(binding_names):
+        raise LaunchPlanError("host argument metadata does not match the entry block")
+    bindings = {argument.get_name(): name for argument, name in zip(entry_block.arguments, binding_names)}
+
+    direct_launches = [
+        operation for operation in entry_block.operations if _operation_name(operation) == "gpu.launch_func"
+    ]
+    all_launches = [
+        operation for operation in _walk_operations(host_operation) if _operation_name(operation) == "gpu.launch_func"
+    ]
+    if len(direct_launches) != len(all_launches):
+        raise LaunchPlanError("gpu.launch_func nested in control flow is not supported")
+    if not direct_launches:
+        raise LaunchPlanError("host entry contains no gpu.launch_func operations")
+
+    launches = []
+    for launch_id, operation in enumerate(direct_launches):
+        launch = getattr(operation, "opview", operation)
+        if launch.clusterSizeX is not None or launch.cooperative:
+            raise LaunchPlanError("clustered and cooperative launches are not supported")
+        grid = tuple(
+            _constant_int(value, f"launch {launch_id} grid dimension")
+            for value in (launch.gridSizeX, launch.gridSizeY, launch.gridSizeZ)
+        )
+        block = tuple(
+            _constant_int(value, f"launch {launch_id} block dimension")
+            for value in (launch.blockSizeX, launch.blockSizeY, launch.blockSizeZ)
+        )
+        if any(value <= 0 for value in (*grid, *block)):
+            raise LaunchPlanError(f"launch {launch_id} grid and block dimensions must be positive")
+        shared_memory = (
+            0
+            if launch.dynamicSharedMemorySize is None
+            else _constant_int(launch.dynamicSharedMemorySize, f"launch {launch_id} shared memory")
+        )
+        if shared_memory < 0:
+            raise LaunchPlanError(f"launch {launch_id} shared memory must be non-negative")
+        arguments = tuple(
+            _extract_launch_argument(value, index, entry_block, bindings)
+            for index, value in enumerate(launch.kernelOperands)
+        )
+        launches.append(
+            KernelLaunch(
+                id=launch_id,
+                kernel=str(launch.kernel),
+                grid=grid,
+                block=block,
+                shared_memory=shared_memory,
+                arguments=arguments,
+                dependencies=() if launch_id == 0 else (launch_id - 1,),
+            )
+        )
+
+    supported_host_operations = {"arith.constant", "gpu.launch_func", "func.return"}
+    for operation in entry_block.operations:
+        name = _operation_name(operation)
+        if name not in supported_host_operations:
+            raise LaunchPlanError(f"host operation {name} is not supported in an exported launch plan")
+    return LaunchPlan(host_entry=host_entry, launches=tuple(launches))
 
 
 def _extract_device_objects(compiled_module) -> tuple[DeviceObject, ...]:
@@ -283,6 +471,8 @@ class CompiledArtifact:
         backend: str = "",
         target: str = "",
         kernel_abi: str = "",
+        launch_plan: Optional[LaunchPlan] = None,
+        launch_plan_error: Optional[str] = None,
     ):
         self._ir_text = str(compiled_module)
         self._device_objects = _extract_device_objects(compiled_module)
@@ -294,6 +484,8 @@ class CompiledArtifact:
         self._backend = backend
         self._target = target
         self._kernel_abi = kernel_abi
+        self._launch_plan = launch_plan
+        self._launch_plan_error = launch_plan_error
         self._module = None
         self._engine = None
         self._jit_module = None
@@ -349,6 +541,8 @@ class CompiledArtifact:
             "target": self._target,
             "kernel_abi": self._kernel_abi,
             "device_objects": self._device_objects,
+            "launch_plan": self._launch_plan,
+            "launch_plan_error": self._launch_plan_error,
         }
         if self._source_ir is not None:
             state["source_ir_zlib"] = zlib.compress(self._source_ir.encode("utf-8"))
@@ -371,6 +565,8 @@ class CompiledArtifact:
         self._target = state.get("target", "")
         self._kernel_abi = state.get("kernel_abi", "")
         self._device_objects = tuple(state.get("device_objects", ()))
+        self._launch_plan = state.get("launch_plan")
+        self._launch_plan_error = state.get("launch_plan_error")
         self._post_load_processors = []
         missing: List[str] = []
         for ref in state.get("processor_refs", []):
@@ -489,4 +685,6 @@ class CompiledArtifact:
             target=self._target,
             kernel_abi=self._kernel_abi,
             device_objects=self._device_objects,
+            launch_plan=self._launch_plan,
+            launch_plan_error=self._launch_plan_error,
         )

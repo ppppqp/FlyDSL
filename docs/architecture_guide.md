@@ -395,6 +395,14 @@ payloads are copied while FlyDSL's MLIR runtime owns the compiled module, allowi
 receive plain Python data without loading another MLIR extension. The ROCm backend reports
 `rocm.bare_ptr`, matching its kernel lowering options.
 
+While the source module is live, FlyDSL also attempts to extract a restricted `LaunchPlan`.
+Accepted plans contain only top-level straight-line `gpu.launch_func` operations with static
+grid/block/shared-memory values and direct raw global-pointer, basic scalar, or scalar-constant
+arguments. Launches receive a conservative source-order dependency chain. Nested control flow,
+computed or view-derived arguments, FlyDSL memrefs with possible ABI expansion, clustered
+launches, and cooperative launches leave `launch_plan` unset and record the reason in
+`launch_plan_error`; normal FlyDSL compilation is unaffected.
+
 This device ABI is intentionally separate from `CallState` and `__c_abi_spec__()`, which describe
 the JIT-compiled host wrapper. External schedulers must not use those host slots as device-kernel
 arguments. Orchestration metadata is preserved by the disk cache; legacy cached artifacts must be

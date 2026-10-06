@@ -95,6 +95,9 @@ def test_class_defined_jit_method_binds_self_and_launches_kernel_method():
     assert "gpu.func @kernel_0" in artifact.source_ir
     assert "gpu.launch_func" in artifact.source_ir
     assert "@kernels::@kernel_0" in artifact.source_ir
+    exported = artifact.export_for_orchestration()
+    assert exported.launch_plan is not None
+    assert exported.launch_plan.launches[0].arguments[0].binding == "value"
 
 
 def test_class_defined_jit_call_special_method_binds_self():
