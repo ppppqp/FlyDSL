@@ -72,3 +72,4 @@ def test_registering_extra_backend_does_not_change_default(monkeypatch):
     assert backends.compile_backend_name() == "rocm"
     assert backends.get_backend(arch="gfx942").target.backend == "rocm"
     assert backends.get_backend("dummy", arch="dummy0").target.backend == "dummy"
+    assert backends.get_backend("dummy", arch="dummy0").orchestration_kernel_abi() == ""

@@ -72,6 +72,8 @@ def test_device_objects_are_copied_out_of_the_producing_mlir_runtime():
     assert len(exported.device_objects) == 1
     assert exported.device_objects[0].data == b"\x7fELF"
     assert "gfx942" in exported.device_objects[0].target
+    restored = pickle.loads(pickle.dumps(artifact)).export_for_orchestration()
+    assert restored.device_objects == exported.device_objects
 
 
 def test_legacy_artifact_requires_recompilation():

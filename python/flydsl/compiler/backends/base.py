@@ -79,8 +79,8 @@ class BaseBackend(metaclass=ABCMeta):
         return None
 
     def orchestration_kernel_abi(self) -> str:
-        """Return the physical device-kernel ABI exported to orchestration layers."""
-        raise NotImplementedError(f"{type(self).__name__} does not expose a device-kernel ABI")
+        """Return the physical device-kernel ABI, or empty when export is unsupported."""
+        return ""
 
     def external_binary_pipeline_fragments(self, *, compile_hints: dict) -> Tuple[List[str], str]:
         """Split the pipeline for external device binary code generation.

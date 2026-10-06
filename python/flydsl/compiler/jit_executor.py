@@ -60,7 +60,7 @@ def _extract_device_objects(compiled_module) -> tuple[DeviceObject, ...]:
                 objects.append(
                     DeviceObject(
                         data=gpu_object.object,
-                        format=gpu_object.format,
+                        format=int(gpu_object.format),
                         target=str(gpu_object.target),
                     )
                 )
