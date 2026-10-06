@@ -6,6 +6,7 @@ import importlib
 import pickle
 import threading
 import zlib
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -15,6 +16,61 @@ from .._mlir.execution_engine import ExecutionEngine
 
 _GPU_MODULE_INIT = "flydsl_gpu_module_init"
 _GPU_MODULE_LOAD_TO_DEVICE = "flydsl_gpu_module_load_to_device"
+
+
+@dataclass(frozen=True)
+class DeviceObject:
+    data: bytes
+    format: int
+    target: str
+
+
+@dataclass(frozen=True)
+class OrchestrationArtifact:
+    """Stable, runtime-independent output for an external orchestration layer.
+
+    ``compiled_ir`` contains the final ``gpu.binary`` objects. ``source_ir`` retains
+    the host-side ``gpu.launch_func`` structure. ``kernel_abi`` describes device
+    entry points and must not be confused with the JIT host wrapper's C ABI.
+    """
+
+    compiled_ir: str
+    source_ir: Optional[str]
+    host_entry: str
+    backend: str
+    target: str
+    kernel_abi: str
+    device_objects: tuple[DeviceObject, ...]
+
+
+def _extract_device_objects(compiled_module) -> tuple[DeviceObject, ...]:
+    """Copy gpu.binary payloads while the producing MLIR runtime owns the module."""
+    operation = getattr(compiled_module, "operation", None)
+    if operation is None:
+        return ()
+
+    from .._mlir.dialects import gpu
+
+    objects = []
+
+    def visit(op):
+        if op.name == "gpu.binary":
+            for attribute in ir.ArrayAttr(op.attributes["objects"]):
+                gpu_object = gpu.ObjectAttr(attribute)
+                objects.append(
+                    DeviceObject(
+                        data=gpu_object.object,
+                        format=gpu_object.format,
+                        target=str(gpu_object.target),
+                    )
+                )
+        for region in op.regions:
+            for block in region.blocks:
+                for child in block.operations:
+                    visit(child)
+
+    visit(operation)
+    return tuple(objects)
 
 
 def _qualname(fn: Callable) -> Optional[str]:
@@ -224,13 +280,20 @@ class CompiledArtifact:
         post_load_processors: Optional[List[Callable]] = None,
         link_libs: Optional[List[str]] = None,
         uses_explicit_module: bool = False,
+        backend: str = "",
+        target: str = "",
+        kernel_abi: str = "",
     ):
         self._ir_text = str(compiled_module)
+        self._device_objects = _extract_device_objects(compiled_module)
         self._entry = func_name
         self._source_ir = source_ir
         self._post_load_processors = post_load_processors or []
         self._link_libs = link_libs or []
         self._uses_explicit_module = uses_explicit_module
+        self._backend = backend
+        self._target = target
+        self._kernel_abi = kernel_abi
         self._module = None
         self._engine = None
         self._jit_module = None
@@ -238,9 +301,9 @@ class CompiledArtifact:
         self._lock = threading.Lock()
 
     def __getstate__(self):
-        # Keep pre-lowering source IR process-local. The compiled MLIR is needed
-        # to recreate the ExecutionEngine and compresses well because its GPU
-        # binary is represented as escaped text.
+        # Both the compiled MLIR and source IR compress well. The source IR is
+        # retained because external orchestration exports need its gpu.launch_func
+        # structure after a disk-cache hit.
         #
         # Serialise post-load processors by fully-qualified name so the pickle
         # stream carries no concrete callables.
@@ -276,13 +339,20 @@ class CompiledArtifact:
                 "must not be cached to disk, suppress the disk-cache write "
                 "path for it."
             )
-        return {
+        state = {
             "ir_zlib": zlib.compress(self._ir_text.encode("utf-8")),
             "entry": self._entry,
             "processor_refs": refs,
             "link_libs": self._link_libs,
             "uses_explicit_module": self._uses_explicit_module,
+            "backend": self._backend,
+            "target": self._target,
+            "kernel_abi": self._kernel_abi,
+            "device_objects": self._device_objects,
         }
+        if self._source_ir is not None:
+            state["source_ir_zlib"] = zlib.compress(self._source_ir.encode("utf-8"))
+        return state
 
     def __setstate__(self, state):
         # Accept the uncompressed format written by older FlyDSL versions.
@@ -291,9 +361,16 @@ class CompiledArtifact:
         else:
             self._ir_text = state["ir_text"]
         self._entry = state["entry"]
-        self._source_ir = state.get("source_ir")
+        if "source_ir_zlib" in state:
+            self._source_ir = zlib.decompress(state["source_ir_zlib"]).decode("utf-8")
+        else:
+            self._source_ir = state.get("source_ir")
         self._link_libs = state.get("link_libs", [])
         self._uses_explicit_module = state.get("uses_explicit_module", False)
+        self._backend = state.get("backend", "")
+        self._target = state.get("target", "")
+        self._kernel_abi = state.get("kernel_abi", "")
+        self._device_objects = tuple(state.get("device_objects", ()))
         self._post_load_processors = []
         missing: List[str] = []
         for ref in state.get("processor_refs", []):
@@ -393,3 +470,23 @@ class CompiledArtifact:
     @property
     def source_ir(self) -> Optional[str]:
         return self._source_ir
+
+    @property
+    def entry(self) -> str:
+        return self._entry
+
+    def export_for_orchestration(self) -> OrchestrationArtifact:
+        """Return public compiler output without initializing FlyDSL's runtime."""
+        if not self._backend or not self._target or not self._kernel_abi:
+            raise RuntimeError(
+                "compiled artifact predates orchestration metadata; recompile it with the current FlyDSL"
+            )
+        return OrchestrationArtifact(
+            compiled_ir=self._ir_text,
+            source_ir=self._source_ir,
+            host_entry=self._entry,
+            backend=self._backend,
+            target=self._target,
+            kernel_abi=self._kernel_abi,
+            device_objects=self._device_objects,
+        )

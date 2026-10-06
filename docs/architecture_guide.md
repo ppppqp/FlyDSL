@@ -378,7 +378,29 @@ class MyJitArg:
 interface; they need not be one-to-one with `__get_ir_types__()`. Do not
 implement `__get_c_pointers__` — that hook has been removed.
 
-### 4.6 `ASTRewriter`
+### 4.6 External orchestration artifact
+
+`flyc.compile()` retains its compiler output through the public
+`CompiledFunction.artifact` property. An orchestration layer can obtain an immutable export without
+initializing FlyDSL's `ExecutionEngine`:
+
+```python
+compiled = flyc.compile(program, *arguments)
+exported = compiled.artifact.export_for_orchestration()
+```
+
+The export contains the source IR with `gpu.launch_func`, final IR, copied `gpu.binary` payloads,
+host entry point, backend and target identities, and the physical device-kernel ABI. Binary
+payloads are copied while FlyDSL's MLIR runtime owns the compiled module, allowing a consumer to
+receive plain Python data without loading another MLIR extension. The ROCm backend reports
+`rocm.bare_ptr`, matching its kernel lowering options.
+
+This device ABI is intentionally separate from `CallState` and `__c_abi_spec__()`, which describe
+the JIT-compiled host wrapper. External schedulers must not use those host slots as device-kernel
+arguments. Orchestration metadata is preserved by the disk cache; legacy cached artifacts must be
+recompiled before export.
+
+### 4.7 `ASTRewriter`
 
 Transforms Python control flow to MLIR ops at the AST level:
 

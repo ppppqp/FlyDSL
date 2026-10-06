@@ -107,6 +107,9 @@ class RocmBackend(BaseBackend):
         pre_binary_fragments, binary_fragment = self._pipeline_parts(compile_hints=compile_hints)
         return [*pre_binary_fragments, binary_fragment]
 
+    def orchestration_kernel_abi(self) -> str:
+        return "rocm.bare_ptr"
+
     def external_binary_pipeline_fragments(self, *, compile_hints: dict) -> Tuple[List[str], str]:
         return self._pipeline_parts(compile_hints=compile_hints)
 

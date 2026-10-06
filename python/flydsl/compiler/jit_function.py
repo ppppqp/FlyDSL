@@ -1580,6 +1580,9 @@ class JitFunction:
                         post_load_processors=post_load_processors,
                         link_libs=link_libs,
                         uses_explicit_module=extern_linked,
+                        backend=backend.target.backend,
+                        target=backend.target.arch,
+                        kernel_abi=backend.orchestration_kernel_abi(),
                     )
 
                     # Always keep a reference to the latest compilation result so
@@ -1651,6 +1654,11 @@ class CompiledFunction:
 
     def __call__(self, *args):
         return self._call_state(args)
+
+    @property
+    def artifact(self) -> CompiledArtifact:
+        """The compiler artifact retained by this callable."""
+        return self._keepalive
 
 
 def _compile_impl(func, *args) -> Optional[CompiledFunction]:
