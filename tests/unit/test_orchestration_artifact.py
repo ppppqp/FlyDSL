@@ -142,6 +142,29 @@ def test_extracts_restricted_straight_line_launch_plan():
     assert plan.launches[1].dependencies == (0,)
 
 
+def test_direct_host_memref_is_preserved_for_physical_abi_expansion():
+    context = _create_mlir_context()
+    with context:
+        module = ir.Module.parse("""module attributes {gpu.container_module} {
+          gpu.module @kernels {
+            gpu.func @stage(%arg0: !fly.memref<f32, global, (?):(1)>) kernel { gpu.return }
+          }
+          func.func @launch(%arg0: !fly.memref<f32, global, (?):(1)>) {
+            %c1 = arith.constant 1 : index
+            %c64 = arith.constant 64 : index
+            gpu.launch_func @kernels::@stage
+              blocks in (%c1, %c1, %c1) threads in (%c64, %c1, %c1)
+              args(%arg0 : !fly.memref<f32, global, (?):(1)>)
+            return
+          }
+        }""")
+        plan = extract_launch_plan(module, "launch", ("output",))
+
+    argument = plan.launches[0].arguments[0]
+    assert argument.kind == "memref"
+    assert argument.binding == "output"
+
+
 def test_rejects_launch_nested_in_control_flow():
     context = _create_mlir_context()
     with context:

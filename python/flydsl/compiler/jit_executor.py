@@ -127,9 +127,9 @@ def _extract_launch_argument(value, logical_index: int, entry_block, bindings) -
                 raise LaunchPlanError(f"kernel argument {logical_index} uses non-global pointer type {source_type}")
             return LaunchArgument(logical_index, "resource", source_type, binding=binding)
         if source_type.startswith("!fly.memref<") or source_type.startswith("memref<"):
-            raise LaunchPlanError(
-                f"kernel argument {logical_index} uses {source_type}; memref ABI expansion is not yet supported"
-            )
+            # Preserve the logical memref here. Consumers must expand its pointer and
+            # layout descriptor according to the selected device ABI.
+            return LaunchArgument(logical_index, "memref", source_type, binding=binding)
         if source_type in {"i32", "i64", "f32", "f64"}:
             return LaunchArgument(logical_index, "scalar", source_type, binding=binding)
         raise LaunchPlanError(f"kernel argument {logical_index} has unsupported type {source_type}")
