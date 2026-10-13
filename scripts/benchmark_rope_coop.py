@@ -151,10 +151,15 @@ def main():
                         # Compilation/capture can leave a short kernel at idle
                         # clocks. Sustain GPU work on both variants before the
                         # alternating measurements, rather than timing ramp-up.
-                        for _ in range(args.warmup_replays):
+                        # Bound the number of outstanding graph launches and
+                        # finish each variant before switching graphs. Some HIP
+                        # runtimes fail when hundreds of alternating replays are
+                        # queued at once. These waits are outside timed regions.
+                        for offset in range(0, args.warmup_replays, 16):
                             for graph in graphs:
-                                graph.replay()
-                        torch.cuda.synchronize()
+                                for _ in range(min(16, args.warmup_replays - offset)):
+                                    graph.replay()
+                                torch.cuda.synchronize()
                         timings = [[], []]
                         for round_id in range(args.rounds):
                             for variant in ((0, 1) if round_id % 2 == 0 else (1, 0)):
