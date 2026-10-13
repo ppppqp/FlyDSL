@@ -15,14 +15,14 @@ implementation selection and comparison in correctness tests and benchmarks.
 
 from types import SimpleNamespace
 
-
 from . import block as _block
 from . import warp as _warp
+from .block import exchange as _block_exchange
 from .block import reduce as _block_reduce
 from .block import scan as _block_scan
+from .warp import permute as _warp_permute
 from .warp import reduce as _warp_reduce
 from .warp import scan as _warp_scan
-from .warp import permute as _warp_permute
 from .warp.bitonic_sort import *
 from .warp.exchange import *
 from .warp.load import *
@@ -42,10 +42,11 @@ warp_exclusive_scan = _warp_scan.warp_exclusive_scan
 warp_scan = _warp_scan.warp_scan
 warp_scan_with_aggregate = _warp_scan.warp_scan_with_aggregate
 warp_permute = _warp_permute.warp_permute
+warp_permute_xor = _warp_permute.warp_permute_xor
 
 
 # What the block classes below fold through, in place of the dispatched warp
-# namespace. Only the two names block scope actually reaches for are here, so a
+# namespace. Only the names block scope actually reaches for are here, so a
 # warp primitive that gains a block-scope caller has to be added deliberately.
 _UNIVERSAL_WARP = SimpleNamespace(
     warp_reduce=warp_reduce,
@@ -160,6 +161,12 @@ class BlockScan(_block_scan.BlockScan):
         )
         # The callback receives 6; all four methods produce the same respective results as above.
     """
+
+    warp_ops = _UNIVERSAL_WARP
+
+
+class BlockExchange(_block_exchange.BlockExchange):
+    """Redistribute block tiles using portable warp operations."""
 
     warp_ops = _UNIVERSAL_WARP
 

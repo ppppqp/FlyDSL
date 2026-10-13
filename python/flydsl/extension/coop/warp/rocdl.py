@@ -12,7 +12,7 @@ less to gain, since LLVM's own rewrite already reaches pure DPP there.
 from ....compiler.backends import current_target
 from ....expr.gpu import lane_id
 from ....expr.numeric import Int32, Integer, Numeric
-from ....expr.rocdl import ds_swizzle, readlane, update_dpp
+from ....expr.rocdl import ds_bpermute, ds_swizzle, readlane, update_dpp
 from ....expr.typing import ReductionOp
 from .._common import (
     _combine,
@@ -22,7 +22,6 @@ from .._common import (
     _thread_partial,
 )
 from .._values import _as_items
-from ....expr.rocdl import ds_bpermute
 from . import scan as _universal_scan
 from .permute import _permute
 from .reduce import warp_reduce as _portable_warp_reduce

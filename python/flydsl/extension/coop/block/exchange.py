@@ -9,7 +9,7 @@ from ....expr.primitive import get_scalar, make_layout
 from ....expr.struct import Struct
 from ....expr.typing import Array, Vector
 from .. import warp as _dispatched_warp
-from .._common import linear_thread_id, require_power_of_two
+from .._common import _linear_thread_id, _require_power_of_two
 from ._spec import _block_shape
 
 __all__ = ["BlockExchange"]
@@ -43,8 +43,8 @@ class _BlockExchangeMeta(type):
             raise TypeError("BlockExchange dtype must be an 8-, 16-, 32-, or 64-bit Numeric type")
         block_size = _block_shape(block_size)
         threads = block_size[0] * block_size[1] * block_size[2]
-        require_power_of_two(threads, "block thread count")
-        require_power_of_two(items, "items_per_thread")
+        _require_power_of_two(threads, "block thread count")
+        _require_power_of_two(items, "items_per_thread")
         if any(isinstance(dim, bool) for dim in block_size) or isinstance(items, bool):
             raise TypeError("block dimensions and items_per_thread must be integers, not bool")
         if threads > 1024:
@@ -156,7 +156,7 @@ class BlockExchange(metaclass=_BlockExchangeMeta):
             return cls._exchange_warp(values, source, destination)
         if storage is None:
             raise TypeError("cross-wave BlockExchange requires SharedStorage")
-        tid = linear_thread_id(cls.block_size)
+        tid = _linear_thread_id(cls.block_size)
         src = make_layout(*_layout_spec(source, cls.block_threads, cls.items_per_thread, cls.warp_threads))
         dst = make_layout(*_layout_spec(destination, cls.block_threads, cls.items_per_thread, cls.warp_threads))
         # A scalar thread coordinate is decomposed by Fly into (lane, warp)
@@ -176,7 +176,7 @@ class BlockExchange(metaclass=_BlockExchangeMeta):
 
     @classmethod
     def _exchange_warp(cls, values, source, destination):
-        lane = linear_thread_id(cls.block_size) % cls.warp_threads
+        lane = _linear_thread_id(cls.block_size) % cls.warp_threads
         outputs = []
         for item in range(cls.items_per_thread):
             # Within a wave, both striped arrangements have the same ranks.

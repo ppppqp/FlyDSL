@@ -6,13 +6,13 @@
 from ....expr.gpu import lane_id, num_warp_threads, shuffle_idx, shuffle_xor
 from ....expr.numeric import Int32, Numeric
 from ....expr.typing import Vector
-from .._common import resolve_warp_width
+from .._common import _resolve_warp_width
 
 __all__ = ["warp_permute", "warp_permute_xor"]
 
 
 def _permute(value, source_lane, width, move_word, *, xor=False):
-    width = resolve_warp_width(width, "warp_permute width")
+    width = _resolve_warp_width(width, "warp_permute width")
     if not isinstance(value, (Numeric, Vector)) or value.dtype.width not in (8, 16, 32, 64):
         raise TypeError("warp_permute expects an 8-, 16-, 32-, or 64-bit scalar or Vector")
     if isinstance(source_lane, int) and not 0 <= source_lane < width:

@@ -37,6 +37,8 @@ except ImportError:
 
 
 CONVERSIONS = ("blocked_to_striped", "striped_to_blocked", "blocked_to_warp_striped", "warp_striped_to_blocked")
+# BlockExchange requires powers of two; reductions also accept three-wave blocks.
+EXCHANGE_BLOCK_THREADS = tuple(n for n in BLOCK_THREADS if n & (n - 1) == 0)
 EXCHANGE_DTYPES = (*DTYPES, (fx.Float16, "torch.float16"))
 BLOCK_SHAPES = ((64, 1, 1), (128, 1, 1), (256, 1, 1), (64, 2, 2))
 
@@ -123,7 +125,7 @@ def test_exchange_across_block_shapes(block_size, conversion):
 @pytest.mark.l2_device
 @pytest.mark.rocm_lower
 @pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires GPU")
-@pytest.mark.parametrize("block_threads", BLOCK_THREADS, ids=lambda n: f"t{n}")
+@pytest.mark.parametrize("block_threads", EXCHANGE_BLOCK_THREADS, ids=lambda n: f"t{n}")
 @pytest.mark.parametrize("conversion", CONVERSIONS)
 def test_exchange_across_every_legal_block_width(block_threads, conversion):
     """One thread through 1024, including partial waves and multiple waves."""
@@ -188,7 +190,15 @@ def test_a_sub_wave_block_narrows_its_logical_warp(block_threads):
 @pytest.mark.l0_backend_agnostic
 @pytest.mark.parametrize(
     "params",
-    ((fx.Int32, 3, 4), (fx.Int32, 64, 3), (fx.Int32, 2048, 2), (fx.Int32, 64, 0), (fx.Int32, 64, True), (int, 64, 4)),
+    (
+        (fx.Int32, 3, 4),
+        (fx.Int32, 3 * WARP_SIZE, 4),
+        (fx.Int32, 64, 3),
+        (fx.Int32, 2048, 2),
+        (fx.Int32, 64, 0),
+        (fx.Int32, 64, True),
+        (int, 64, 4),
+    ),
 )
 def test_invalid_specializations(params):
     with pytest.raises((TypeError, ValueError)):
