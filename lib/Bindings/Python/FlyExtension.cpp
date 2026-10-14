@@ -17,6 +17,7 @@
 #include "LlvmConfig/llvm.h"
 
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 namespace nb = nanobind;
@@ -65,8 +66,17 @@ struct IntTupleAttrBuilder {
 
   void clear() { dyncElems.clear(); }
 
+  IntAttr staticIntFromValue(nb::handle handle) {
+    long long value = PyLong_AsLongLong(handle.ptr());
+    if (PyErr_Occurred())
+      throw nb::python_error();
+    if (value < std::numeric_limits<int32_t>::min() || value > std::numeric_limits<int32_t>::max())
+      throw std::overflow_error("Static int_tuple leaf must fit in a signed 32-bit integer");
+    return IntAttr::getStatic(ctx, static_cast<int32_t>(value));
+  }
+
   IntAttr dynamicIntFromValue(nb::handle handle, const char *what) {
-    auto typeName = [&] { return std::string(nb::str(nb::type_name(handle)).c_str()); };
+    auto typeName = [&] { return std::string(nb::type_name(handle.type()).c_str()); };
     if (!nb::hasattr(handle, MLIR_PYTHON_CAPI_PTR_ATTR))
       throw std::invalid_argument(std::string(what) +
                                   " must be an i32/i64 MLIR Value, got: " + typeName());
@@ -93,8 +103,7 @@ struct IntTupleAttrBuilder {
     // A static coefficient is a python int; a dynamic one is an i32/i64 MLIR Value.
     nb::handle value = basis.value;
     if (PyLong_Check(value.ptr()))
-      return IntTupleAttr::get(
-          BasisAttr::get(IntAttr::getStatic(ctx, PyLong_AsLong(value.ptr())), modes));
+      return IntTupleAttr::get(BasisAttr::get(staticIntFromValue(value), modes));
     return IntTupleAttr::get(
         BasisAttr::get(dynamicIntFromValue(value, "Basis coefficient"), modes));
   }
@@ -107,8 +116,7 @@ struct IntTupleAttrBuilder {
       }
       return IntTupleAttr::get(ArrayAttr::get(ctx, elements));
     } else if (PyLong_Check(args.ptr())) {
-      int32_t cInt = PyLong_AsLong(args.ptr());
-      return IntTupleAttr::get(IntAttr::getStatic(ctx, cInt));
+      return IntTupleAttr::get(staticIntFromValue(args));
     } else if (args.is_none()) {
       return IntTupleAttr::getLeafNone(ctx);
     } else if (nb::isinstance<PyBasis>(args)) {
@@ -232,7 +240,7 @@ struct PyIntTupleType : PyConcreteType<PyIntTupleType> {
           auto attr = builder(int_or_tuple);
           return PyIntTupleType(context->getRef(), wrap(IntTupleType::get(attr)));
         },
-        "int_or_tuple"_a, nb::kw_only(), "context"_a = nb::none(),
+        "int_or_tuple"_a.none(), nb::kw_only(), "context"_a = nb::none(),
         // clang-format off
         nb::sig("def get(int_or_tuple, context: " MAKE_MLIR_PYTHON_QUALNAME("ir.Context") " | None = None)"),
         // clang-format on
@@ -249,6 +257,8 @@ struct PyIntTupleType : PyConcreteType<PyIntTupleType> {
     });
     c.def_prop_ro("is_leaf_int",
                   [](PyIntTupleType &self) { return self.toCppType().getAttr().isLeafInt(); });
+    c.def_prop_ro("is_leaf_none",
+                  [](PyIntTupleType &self) { return self.toCppType().getAttr().isLeafNone(); });
     c.def_prop_ro("is_leaf_basis",
                   [](PyIntTupleType &self) { return self.toCppType().getAttr().isLeafBasis(); });
     c.def_prop_ro("get_leaf_as_basis", [](PyIntTupleType &self) -> MlirType {
@@ -1040,7 +1050,7 @@ NB_MODULE(_mlirDialectsFly, m) {
         auto attr = builder(int_or_tuple);
         return std::make_pair(wrap(IntTupleType::get(attr)), builder.dyncElems);
       },
-      "int_or_tuple"_a, "context"_a = nb::none(),
+      "int_or_tuple"_a.none(), "context"_a = nb::none(),
       // clang-format off
       nb::sig("def infer_int_tuple_type(int_or_tuple, context: " MAKE_MLIR_PYTHON_QUALNAME("ir.Context") " | None = None)"),
       // clang-format on

@@ -693,6 +693,8 @@ class IntTuple(BuiltinDslType):
 
     @staticmethod
     def _static_leaf_to_py(ty):
+        if ty.is_leaf_none:
+            return None
         if ty.is_leaf_basis:
             bt = ty.get_leaf_as_basis
             return Basis(bt.value, list(bt.modes))

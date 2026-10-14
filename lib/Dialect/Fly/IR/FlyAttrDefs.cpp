@@ -182,8 +182,8 @@ int32_t IntTupleAttr::rank(ArrayRef<int32_t> idxs) const {
 
 int32_t IntTupleAttr::depth() const {
   if (auto tupleAttr = dyn_cast<ArrayAttr>(this->getValue())) {
-    int maxLeafDepth = at(0).depth();
-    for (int i = 1; i < rank(); ++i) {
+    int maxLeafDepth = 0;
+    for (int i = 0; i < rank(); ++i) {
       maxLeafDepth = std::max(maxLeafDepth, at(i).depth());
     }
     return 1 + maxLeafDepth;
@@ -460,6 +460,8 @@ void BasisAttr::print(::mlir::AsmPrinter &odsPrinter) const {
   auto *ctx = odsParser.getBuilder().getContext();
   if (odsParser.parseOptionalLParen().succeeded()) {
     SmallVector<Attribute> elements;
+    if (odsParser.parseOptionalRParen().succeeded())
+      return IntTupleAttr::get(ArrayAttr::get(ctx, elements));
     do {
       elements.push_back(IntTupleAttr::parse(odsParser, odsType));
     } while (odsParser.parseOptionalComma().succeeded());
@@ -474,9 +476,9 @@ void BasisAttr::print(::mlir::AsmPrinter &odsPrinter) const {
 void IntTupleAttr::print(::mlir::AsmPrinter &odsPrinter) const {
   if (auto tupleAttr = dyn_cast<ArrayAttr>(this->getValue())) {
     odsPrinter << "(";
-    at(0).print(odsPrinter);
-    for (int i = 1; i < rank(); ++i) {
-      odsPrinter << ",";
+    for (int i = 0; i < rank(); ++i) {
+      if (i)
+        odsPrinter << ",";
       at(i).print(odsPrinter);
     }
     odsPrinter << ")";
