@@ -9,8 +9,8 @@ Uses exp2(x * log2e) for fast exponentiation.
 The kernel register-buffers the row across max, exp+sum, and normalize passes.
 
 Two paths:
-  - Fast path (N % tile_cols == 0): buffer_load/store vectorised access.
-  - Generic path (arbitrary N): scalar fx.copy with masking.
+  - Vector path (N >= max(THREADS_PER_ROW, vec_width)): 128-bit copies plus a scalar tail.
+  - Small-row path (below that threshold): scalar fx.copy with masking.
 """
 
 import flydsl.compiler as flyc
@@ -27,7 +27,7 @@ WARP_SIZE = get_warp_size()
 
 # Bumped whenever a kernel or search-space change can change the tuned winner. The
 # scratch cache does not fingerprint kernel source, so this is what forces a retune.
-TUNING_SCHEMA = 6
+TUNING_SCHEMA = 7
 
 
 def build_softmax_module(
@@ -54,7 +54,6 @@ def build_softmax_module(
     # BufferCopy128b moves one 128-bit transaction per lane, so the register
     # vector width must satisfy vec_width * elem_bits == 128 (8 for 16-bit, 4 for f32).
     vec_width = 128 // elem_bits
-    tile_cols = THREADS_PER_ROW * vec_width
     BlockReduce = fx.coop.BlockReduce[fx.Float32, BLOCK_THREADS]
     SharedStorage = BlockReduce.SharedStorage
 
@@ -99,10 +98,12 @@ def build_softmax_module(
                 return BlockReduce(val, op, storage=lds)
 
         # ==================================================================
-        # Fast path: N is a multiple of tile_cols
+        # Fast path: vector prefix with an optional scalar tail
         # ==================================================================
-        if const_expr(N >= tile_cols and N % tile_cols == 0):
-            num_tiles = N // tile_cols
+        if const_expr(N >= max(THREADS_PER_ROW, vec_width)):
+            vec_tiles = N // vec_width
+            vec_elems = vec_tiles * vec_width
+            num_tiles = (vec_tiles + THREADS_PER_ROW - 1) // THREADS_PER_ROW  # ceildiv
             # ── Layout API: buffer-backed tensors + tiled access ─────
             A_buf = fx.rocdl.make_buffer_tensor(A)
             C_buf = fx.rocdl.make_buffer_tensor(C)
@@ -136,11 +137,21 @@ def build_softmax_module(
 
             for tile_i in range_constexpr(num_tiles):
                 idx = lane + tile_i * THREADS_PER_ROW
-                vec = _load_vec(a_div, idx)
+                valid = idx < vec_tiles
+                safe_idx = valid.select(idx, 0)
+                # only load the vector if valid, otherwise load a dummy vector (the first one) and ignore it.
+                vec = _load_vec(a_div, safe_idx)
                 x = vec.to(fx.Float32)
                 row_buffer.append(x)
                 red_max = x.reduce(ReductionOp.MAX)
-                thread_max = fx.max(thread_max, red_max)
+                thread_max = fx.max(thread_max, valid.select(red_max, c_neg_inf))
+
+            if const_expr(N % vec_width != 0):
+                # Handle the scalar tail, if any, with a masked load and max.
+                tail_valid = lane < N % vec_width
+                tail_idx = tail_valid.select(vec_elems + lane, 0)
+                tail_x = tail_valid.select(row_a[tail_idx].to(fx.Float32), c_neg_inf)
+                thread_max = fx.max(thread_max, tail_x)
 
             global_max = block_reduce(thread_max, ReductionOp.MAX)
 
@@ -153,7 +164,11 @@ def build_softmax_module(
                 exp_val = fmath.exp2(scaled, fastmath=fm_fast)
                 row_buffer[i] = exp_val
                 red_sum = exp_val.reduce(ReductionOp.ADD, fastmath=fm_fast)
-                thread_sum = thread_sum + red_sum
+                thread_sum = thread_sum + (lane + i * THREADS_PER_ROW < vec_tiles).select(red_sum, c_zero_f)
+
+            if const_expr(N % vec_width != 0):
+                tail_exp = tail_valid.select(((tail_x - global_max) * LOG2E).exp2(fastmath=fm_fast), c_zero_f)
+                thread_sum = thread_sum + tail_exp
 
             global_sum = block_reduce(thread_sum, ReductionOp.ADD)
 
@@ -165,11 +180,16 @@ def build_softmax_module(
                 out_e = norm_vec if dtype_str == "f32" else norm_vec.to(elem_dtype)
 
                 out_idx = lane + tile_i * THREADS_PER_ROW
-                _store_vec(out_e, c_div, out_idx)
+                if out_idx < vec_tiles:
+                    _store_vec(out_e, c_div, out_idx)
+
+            if const_expr(N % vec_width != 0):
+                if tail_valid & row_valid:
+                    row_c[vec_elems + lane] = (tail_exp * inv_sum).to(elem_dtype)
 
         else:
             # ==============================================================
-            # Generic path: scalar for arbitrary N
+            # Small-row path: masked scalar access
             # ==============================================================
             A_buf = fx.rocdl.make_buffer_tensor(A)
             C_buf = fx.rocdl.make_buffer_tensor(C)

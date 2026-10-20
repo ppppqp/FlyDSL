@@ -62,11 +62,11 @@ def tile_cols(dtype_str: str, threads_per_row: int) -> int:
 
 
 def uses_fast_path(N: int, dtype_str: str, threads_per_row: int) -> bool:
-    """Whether this candidate takes the vectorized path rather than the scalar one.
+    """Whether the row is wide enough for the vectorized path.
 
-    N > 0 and exact divisibility already imply N >= tile_cols.
+    Short rows retain scalar access to keep more lanes active.
     """
-    return N % tile_cols(dtype_str, threads_per_row) == 0
+    return N >= max(threads_per_row, 128 // elem_bits(dtype_str))
 
 
 def is_legal(

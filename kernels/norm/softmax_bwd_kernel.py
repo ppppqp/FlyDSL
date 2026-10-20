@@ -15,8 +15,8 @@ single fp32 buffer. Rows wider than ``MAX_RESIDENT_COLS`` would spill, so those
 re-load in the second pass instead.
 
 Two paths:
-  - Fast path (N % tile_cols == 0): 128-bit vectorised access.
-  - Generic path (arbitrary N): scalar access with masking.
+  - Vector path (N >= MIN_VECTOR_COLS): 128-bit copies plus a scalar tail.
+  - Small-row path (N < MIN_VECTOR_COLS): scalar access with masking.
 """
 
 import flydsl.compiler as flyc
@@ -53,6 +53,10 @@ WARP_SIZE = get_warp_size()
 MAX_RESIDENT_ELEMS_PER_THREAD = 64
 MAX_RESIDENT_COLS = BLOCK_THREADS * MAX_RESIDENT_ELEMS_PER_THREAD
 
+# Below four elements per thread, the scalar dot product uses more active lanes.
+# On gfx1200, vectorizing short BF16 rows regresses latency by up to 36%.
+MIN_VECTOR_COLS = 4 * BLOCK_THREADS
+
 
 def softmax_bwd_buffered_operands(N: int, dtype_str: str) -> int:
     """How many of (DY, Y) stay register-resident across the block reduction.
@@ -63,9 +67,7 @@ def softmax_bwd_buffered_operands(N: int, dtype_str: str) -> int:
     Exposed so the dispatch thresholds can be asserted without a GPU, mirroring
     ``is_rmsnorm_bwd_two_stage_vec_config`` in ``rmsnorm_bwd_kernel.py``.
     """
-    vec_width = 128 // (32 if dtype_str == "f32" else 16)
-    tile_cols = BLOCK_THREADS * vec_width
-    if N < tile_cols or N % tile_cols != 0:
+    if N < MIN_VECTOR_COLS:
         return 0
     if N <= MAX_RESIDENT_COLS:
         return 2
@@ -79,7 +81,6 @@ def build_softmax_bwd_module(N: int, dtype_str: str = "f32"):
     # BufferCopy128b moves one 128-bit transaction per lane, so the register
     # vector width must satisfy vec_width * elem_bits == 128 (8 for 16-bit, 4 for f32).
     vec_width = 128 // elem_bits
-    tile_cols = BLOCK_THREADS * vec_width
 
     BlockReduce = fx.coop.BlockReduce[fx.Float32, BLOCK_THREADS]
     SharedStorage = BlockReduce.SharedStorage
@@ -115,10 +116,12 @@ def build_softmax_bwd_module(N: int, dtype_str: str = "f32"):
         row_dx = fx.slice(DX_buf, (bid, None))
 
         # ==================================================================
-        # Fast path: N is a multiple of tile_cols
+        # Vector prefix with an optional scalar tail
         # ==================================================================
-        if const_expr(N >= tile_cols and N % tile_cols == 0):
-            num_tiles = N // tile_cols
+        if const_expr(N >= MIN_VECTOR_COLS):
+            vec_tiles = N // vec_width
+            vec_elems = vec_tiles * vec_width
+            num_tiles = (vec_tiles + BLOCK_THREADS - 1) // BLOCK_THREADS
             # Three tiers by row width. Ideal traffic is 3 units (read Y, read
             # DY, write DX); each operand dropped from registers adds one more.
             #   both buffered  -> 3 units
@@ -137,7 +140,8 @@ def build_softmax_bwd_module(N: int, dtype_str: str = "f32"):
 
             def _load_vec(div_tensor, idx):
                 r = fx.make_rmem_tensor(vec_width, elem_dtype)
-                fx.copy(copy_atom, fx.slice(div_tensor, (None, idx)), r)
+                safe_idx = (idx < vec_tiles).select(idx, 0)
+                fx.copy(copy_atom, fx.slice(div_tensor, (None, safe_idx)), r)
                 return fx.memref_load_vec(r)
 
             def _store_vec(val, div_tensor, idx):
@@ -160,7 +164,16 @@ def build_softmax_bwd_module(N: int, dtype_str: str = "f32"):
                 if const_expr(buffer_y):
                     y_buffer.append(y_vec)
                 prod = dy_vec.to(fx.Float32) * y_vec.to(fx.Float32)
-                thread_dot = thread_dot + prod.reduce(ReductionOp.ADD, fastmath=fm_fast)
+                thread_dot = thread_dot + (idx < vec_tiles).select(
+                    prod.reduce(ReductionOp.ADD, fastmath=fm_fast), c_zero_f
+                )
+
+            if const_expr(N % vec_width != 0):
+                tail_valid = tid < N % vec_width
+                tail_idx = tail_valid.select(vec_elems + tid, 0)
+                tail_dy = row_dy[tail_idx].to(fx.Float32)
+                tail_y = row_y[tail_idx].to(fx.Float32)
+                thread_dot = thread_dot + tail_valid.select(tail_dy * tail_y, c_zero_f)
 
             dot = block_reduce_add(thread_dot)
 
@@ -178,11 +191,16 @@ def build_softmax_bwd_module(N: int, dtype_str: str = "f32"):
 
                 dx_vec = y_f * (dy_f - dot)
                 out_e = dx_vec if dtype_str == "f32" else dx_vec.to(elem_dtype)
-                _store_vec(out_e, dx_div, idx)
+                if idx < vec_tiles:
+                    _store_vec(out_e, dx_div, idx)
+
+            if const_expr(N % vec_width != 0):
+                if tail_valid:
+                    row_dx[vec_elems + tid] = (tail_y * (tail_dy - dot)).to(elem_dtype)
 
         else:
             # ==============================================================
-            # Generic path: scalar for arbitrary N
+            # Small-row path: masked scalar access
             # ==============================================================
             copy_atom_s = fx.make_copy_atom(
                 fx.rocdl.BufferCopy16b() if elem_bits <= 16 else fx.rocdl.BufferCopy32b(),
