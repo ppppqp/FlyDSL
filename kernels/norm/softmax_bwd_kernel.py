@@ -24,6 +24,7 @@ import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr.typing import ReductionOp, full
 from kernels.common.kernels_common import dtype_to_elem_type, get_warp_size
+from kernels.norm.softmax_common import _load_vec, _store_vec, row_copy_chunks
 
 KERNEL_NAME = "softmax_bwd_kernel"
 
@@ -82,6 +83,7 @@ def build_softmax_bwd_module(N: int, dtype_str: str = "f32"):
     # vector width must satisfy vec_width * elem_bits == 128 (8 for 16-bit, 4 for f32).
     vec_width = 128 // elem_bits
 
+    copy_chunks = row_copy_chunks(N, BLOCK_THREADS, vec_width)
     BlockReduce = fx.coop.BlockReduce[fx.Float32, BLOCK_THREADS]
     SharedStorage = BlockReduce.SharedStorage
 
@@ -119,84 +121,41 @@ def build_softmax_bwd_module(N: int, dtype_str: str = "f32"):
         # Vector prefix with an optional scalar tail
         # ==================================================================
         if const_expr(N >= MIN_VECTOR_COLS):
-            vec_tiles = N // vec_width
-            vec_elems = vec_tiles * vec_width
-            num_tiles = (vec_tiles + BLOCK_THREADS - 1) // BLOCK_THREADS
-            # Three tiers by row width. Ideal traffic is 3 units (read Y, read
-            # DY, write DX); each operand dropped from registers adds one more.
-            #   both buffered  -> 3 units
-            #   Y only         -> 4 units (DY re-read)
-            #   neither        -> 5 units
-            # Y alone at twice the cap costs the same registers as both operands
-            # at the cap, so the middle tier is free in occupancy terms.
+            # Retain both operands, only Y, or neither as row width grows.
             buffer_dy = N <= MAX_RESIDENT_COLS
             buffer_y = N <= 2 * MAX_RESIDENT_COLS
-
-            dy_div = fx.logical_divide(row_dy, fx.make_layout(vec_width, 1))
-            y_div = fx.logical_divide(row_y, fx.make_layout(vec_width, 1))
-            dx_div = fx.logical_divide(row_dx, fx.make_layout(vec_width, 1))
-
-            copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_bits)
-
-            def _load_vec(div_tensor, idx):
-                r = fx.make_rmem_tensor(vec_width, elem_dtype)
-                safe_idx = (idx < vec_tiles).select(idx, 0)
-                fx.copy(copy_atom, fx.slice(div_tensor, (None, safe_idx)), r)
-                return fx.memref_load_vec(r)
-
-            def _store_vec(val, div_tensor, idx):
-                r = fx.make_rmem_tensor(vec_width, elem_dtype)
-                fx.memref_store_vec(val, r)
-                fx.copy(copy_atom, r, fx.slice(div_tensor, (None, idx)))
-
-            # 1. Load both operands, accumulate the row dot product in fp32.
-            #    Buffered in native dtype; widened only for the arithmetic.
             dy_buffer = []
             y_buffer = []
             thread_dot = c_zero_f
 
-            for tile_i in range_constexpr(num_tiles):
-                idx = tid + tile_i * BLOCK_THREADS
-                dy_vec = _load_vec(dy_div, idx)
-                y_vec = _load_vec(y_div, idx)
+            # 1. Apply validity after the local dot, avoiding elementwise input masks.
+            for i in range_constexpr(len(copy_chunks)):
+                width, base, limit = copy_chunks[i]
+                idx = tid + base
+                dy_vec = _load_vec(row_dy, idx, width, dtype_str, mask=idx < limit)
+                y_vec = _load_vec(row_y, idx, width, dtype_str, mask=idx < limit)
                 if const_expr(buffer_dy):
                     dy_buffer.append(dy_vec)
                 if const_expr(buffer_y):
                     y_buffer.append(y_vec)
                 prod = dy_vec.to(fx.Float32) * y_vec.to(fx.Float32)
-                thread_dot = thread_dot + (idx < vec_tiles).select(
-                    prod.reduce(ReductionOp.ADD, fastmath=fm_fast), c_zero_f
-                )
-
-            if const_expr(N % vec_width != 0):
-                tail_valid = tid < N % vec_width
-                tail_idx = tail_valid.select(vec_elems + tid, 0)
-                tail_dy = row_dy[tail_idx].to(fx.Float32)
-                tail_y = row_y[tail_idx].to(fx.Float32)
-                thread_dot = thread_dot + tail_valid.select(tail_dy * tail_y, c_zero_f)
-
+                thread_dot = thread_dot + (idx < limit).select(prod.reduce(ReductionOp.ADD, fastmath=fm_fast), c_zero_f)
             dot = block_reduce_add(thread_dot)
 
-            # 2. Apply dx = y * (dy - dot)
-            for tile_i in range_constexpr(num_tiles):
-                idx = tid + tile_i * BLOCK_THREADS
+            # 2. Apply dx = y * (dy - dot), reloading unbuffered inputs.
+            for i in range_constexpr(len(copy_chunks)):
+                width, base, limit = copy_chunks[i]
+                idx = tid + base
                 if const_expr(buffer_dy):
-                    dy_f = dy_buffer[tile_i].to(fx.Float32)
+                    dy_vec = dy_buffer[i]
                 else:
-                    dy_f = _load_vec(dy_div, idx).to(fx.Float32)
+                    dy_vec = _load_vec(row_dy, idx, width, dtype_str, mask=idx < limit)
                 if const_expr(buffer_y):
-                    y_f = y_buffer[tile_i].to(fx.Float32)
+                    y_vec = y_buffer[i]
                 else:
-                    y_f = _load_vec(y_div, idx).to(fx.Float32)
-
-                dx_vec = y_f * (dy_f - dot)
-                out_e = dx_vec if dtype_str == "f32" else dx_vec.to(elem_dtype)
-                if idx < vec_tiles:
-                    _store_vec(out_e, dx_div, idx)
-
-            if const_expr(N % vec_width != 0):
-                if tail_valid:
-                    row_dx[vec_elems + tid] = (tail_y * (tail_dy - dot)).to(elem_dtype)
+                    y_vec = _load_vec(row_y, idx, width, dtype_str, mask=idx < limit)
+                dx_vec = y_vec.to(fx.Float32) * (dy_vec.to(fx.Float32) - dot)
+                _store_vec(row_dx, idx, dx_vec, width, dtype_str, mask=idx < limit)
 
         else:
             # ==============================================================

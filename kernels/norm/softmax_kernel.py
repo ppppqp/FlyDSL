@@ -19,6 +19,7 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp, full
 from kernels.common.kernels_common import LOG2E, dtype_to_elem_type, get_warp_size
+from kernels.norm.softmax_common import _load_vec, _store_vec, row_copy_chunks
 
 KERNEL_NAME = "softmax_kernel"
 
@@ -27,7 +28,7 @@ WARP_SIZE = get_warp_size()
 
 # Bumped whenever a kernel or search-space change can change the tuned winner. The
 # scratch cache does not fingerprint kernel source, so this is what forces a retune.
-TUNING_SCHEMA = 7
+TUNING_SCHEMA = 9
 
 
 def build_softmax_module(
@@ -54,6 +55,7 @@ def build_softmax_module(
     # BufferCopy128b moves one 128-bit transaction per lane, so the register
     # vector width must satisfy vec_width * elem_bits == 128 (8 for 16-bit, 4 for f32).
     vec_width = 128 // elem_bits
+    copy_chunks = row_copy_chunks(N, THREADS_PER_ROW, vec_width)
     BlockReduce = fx.coop.BlockReduce[fx.Float32, BLOCK_THREADS]
     SharedStorage = BlockReduce.SharedStorage
 
@@ -101,91 +103,38 @@ def build_softmax_module(
         # Fast path: vector prefix with an optional scalar tail
         # ==================================================================
         if const_expr(N >= max(THREADS_PER_ROW, vec_width)):
-            vec_tiles = N // vec_width
-            vec_elems = vec_tiles * vec_width
-            num_tiles = (vec_tiles + THREADS_PER_ROW - 1) // THREADS_PER_ROW  # ceildiv
-            # ── Layout API: buffer-backed tensors + tiled access ─────
             A_buf = fx.rocdl.make_buffer_tensor(A)
             C_buf = fx.rocdl.make_buffer_tensor(C)
-
             row_a = fx.slice(A_buf, (row_safe, None))
             row_c = fx.slice(C_buf, (row_safe, None))
 
-            a_div = fx.logical_divide(row_a, fx.make_layout(vec_width, 1))
-            c_div = fx.logical_divide(row_c, fx.make_layout(vec_width, 1))
-
-            load_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_bits)
-            store_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_bits)
-
-            def _load_vec(div_tensor, idx):
-                r = fx.make_rmem_tensor(vec_width, elem_dtype)
-                fx.copy(load_atom, fx.slice(div_tensor, (None, idx)), r)
-                return fx.memref_load_vec(r)
-
-            def _store_vec(val, div_tensor, idx):
-                r = fx.make_rmem_tensor(vec_width, elem_dtype)
-                fx.memref_store_vec(val, r)
-                if const_expr(ROWS_PER_BLOCK == 1):
-                    fx.copy(store_atom, r, fx.slice(div_tensor, (None, idx)))
-                else:
-                    if row_valid:
-                        fx.copy(store_atom, r, fx.slice(div_tensor, (None, idx)))
-
-            # 1. Load + compute local max
+            # 1. Load + max. Masked lanes contribute the reduction identity.
             row_buffer = []
             thread_max = c_neg_inf
-
-            for tile_i in range_constexpr(num_tiles):
-                idx = lane + tile_i * THREADS_PER_ROW
-                valid = idx < vec_tiles
-                safe_idx = valid.select(idx, 0)
-                # only load the vector if valid, otherwise load a dummy vector (the first one) and ignore it.
-                vec = _load_vec(a_div, safe_idx)
-                x = vec.to(fx.Float32)
+            for i in range_constexpr(len(copy_chunks)):
+                width, base, limit = copy_chunks[i]
+                idx = lane + base
+                x = _load_vec(row_a, idx, width, dtype_str, mask=idx < limit).to(fx.Float32)
                 row_buffer.append(x)
-                red_max = x.reduce(ReductionOp.MAX)
-                thread_max = fx.max(thread_max, valid.select(red_max, c_neg_inf))
-
-            if const_expr(N % vec_width != 0):
-                # Handle the scalar tail, if any, with a masked load and max.
-                tail_valid = lane < N % vec_width
-                tail_idx = tail_valid.select(vec_elems + lane, 0)
-                tail_x = tail_valid.select(row_a[tail_idx].to(fx.Float32), c_neg_inf)
-                thread_max = fx.max(thread_max, tail_x)
-
+                thread_max = fx.max(thread_max, (idx < limit).select(x.reduce(ReductionOp.MAX), c_neg_inf))
             global_max = block_reduce(thread_max, ReductionOp.MAX)
 
-            # 2. Exp + local sum
+            # 2. Exp + sum, retaining the row in registers.
             thread_sum = c_zero_f
-
-            for i in range_constexpr(num_tiles):
-                x = row_buffer[i]
-                scaled = (x - global_max) * LOG2E
-                exp_val = fmath.exp2(scaled, fastmath=fm_fast)
+            for i in range_constexpr(len(copy_chunks)):
+                width, base, limit = copy_chunks[i]
+                valid = lane + base < limit
+                exp_val = fmath.exp2((row_buffer[i] - global_max) * LOG2E, fastmath=fm_fast)
                 row_buffer[i] = exp_val
-                red_sum = exp_val.reduce(ReductionOp.ADD, fastmath=fm_fast)
-                thread_sum = thread_sum + (lane + i * THREADS_PER_ROW < vec_tiles).select(red_sum, c_zero_f)
-
-            if const_expr(N % vec_width != 0):
-                tail_exp = tail_valid.select(((tail_x - global_max) * LOG2E).exp2(fastmath=fm_fast), c_zero_f)
-                thread_sum = thread_sum + tail_exp
-
+                thread_sum = thread_sum + valid.select(exp_val.reduce(ReductionOp.ADD, fastmath=fm_fast), c_zero_f)
             global_sum = block_reduce(thread_sum, ReductionOp.ADD)
 
-            # 3. Normalize + store
+            # 3. Normalize + masked store.
             inv_sum = 1.0 / global_sum
-
-            for tile_i in range_constexpr(num_tiles):
-                norm_vec = row_buffer[tile_i] * inv_sum
-                out_e = norm_vec if dtype_str == "f32" else norm_vec.to(elem_dtype)
-
-                out_idx = lane + tile_i * THREADS_PER_ROW
-                if out_idx < vec_tiles:
-                    _store_vec(out_e, c_div, out_idx)
-
-            if const_expr(N % vec_width != 0):
-                if tail_valid & row_valid:
-                    row_c[vec_elems + lane] = (tail_exp * inv_sum).to(elem_dtype)
+            for i in range_constexpr(len(copy_chunks)):
+                width, base, limit = copy_chunks[i]
+                idx = lane + base
+                _store_vec(row_c, idx, row_buffer[i] * inv_sum, width, dtype_str, mask=(idx < limit) & row_valid)
 
         else:
             # ==============================================================
