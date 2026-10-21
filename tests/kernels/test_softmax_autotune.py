@@ -42,6 +42,7 @@ DTYPES = [(torch.float32, "f32"), (torch.float16, "f16"), (torch.bfloat16, "bf16
 
 # Small, medium, wide, aligned, arbitrary-column-tail and partial-row-block cases.
 SHAPES = [
+    (7, 3),
     (8, 128),
     (17, 128),
     (16, 2000),
@@ -153,8 +154,11 @@ def test_every_legal_candidate_is_correct(dtype, dtype_str, M, N):
         assert torch.isfinite(out.float()).all()
         assert bool(((row_sums - 1.0).abs() < 0.1).all())
 
-    if N == 2048 and dtype_str in ("f16", "bf16"):
-        assert paths == {True, False}, "N=2048 should exercise both paths in one search"
+    expected_paths = {
+        N >= max(config.kwargs["THREADS_PER_ROW"], 4 if dtype_str == "f32" else 8)
+        for config in candidate_configs(m_in=M, N=N, dtype_str=dtype_str)
+    }
+    assert paths == expected_paths
 
 
 # ── wrapper contract ─────────────────────────────────────────────────────

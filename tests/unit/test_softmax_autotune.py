@@ -209,20 +209,17 @@ def test_all_candidates_take_the_fast_path(dtype_str):
     assert all(uses_fast_path(4096, dtype_str, bt) for bt in (64, 128, 256, 512))
 
 
-def test_mixed_path_set():
-    """bf16 N=2048: 512 threads needs 4096 columns per tile, so it falls to the scalar
-    path while every smaller candidate stays vectorized. One search compares both."""
-    assert [uses_fast_path(2048, "bf16", bt) for bt in (64, 128, 256, 512)] == [
-        True,
-        True,
-        True,
-        False,
-    ]
-
-
 @pytest.mark.parametrize("dtype_str", ["f32", "f16", "bf16"])
-def test_all_candidates_take_the_generic_path(dtype_str):
-    assert not any(uses_fast_path(4097, dtype_str, bt) for bt in (64, 128, 256, 512))
+def test_partial_tiles_and_tails_take_the_vector_path(dtype_str):
+    for N in (1000, 2000, 2048, 4097):
+        assert all(uses_fast_path(N, dtype_str, bt) for bt in (64, 128, 256, 512))
+
+
+@pytest.mark.parametrize("dtype_str,vec_width", [("f32", 4), ("f16", 8), ("bf16", 8)])
+def test_small_rows_take_the_scalar_path(dtype_str, vec_width):
+    assert not any(uses_fast_path(vec_width - 1, dtype_str, bt) for bt in (64, 128, 256, 512))
+    assert all(uses_fast_path(bt, dtype_str, bt) for bt in (64, 128, 256, 512))
+    assert [uses_fast_path(128, dtype_str, bt) for bt in (64, 128, 256, 512)] == [True, True, False, False]
 
 
 # ── cache-key partitioning ───────────────────────────────────────────────

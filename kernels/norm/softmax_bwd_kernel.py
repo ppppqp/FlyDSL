@@ -15,8 +15,8 @@ single fp32 buffer. Rows wider than ``MAX_RESIDENT_COLS`` would spill, so those
 re-load in the second pass instead.
 
 Two paths:
-  - Fast path (N % tile_cols == 0): 128-bit vectorised access.
-  - Generic path (arbitrary N): scalar access with masking.
+  - Vector path (N >= MIN_VECTOR_COLS): 128-bit copies plus a scalar tail.
+  - Small-row path (N < MIN_VECTOR_COLS): scalar access with masking.
 """
 
 import flydsl.compiler as flyc
@@ -24,7 +24,7 @@ import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr.typing import ReductionOp, full
 from kernels.common.kernels_common import dtype_to_elem_type, get_warp_size
-from kernels.norm.softmax_common import _load_vec, _store_vec
+from kernels.norm.softmax_common import _load_vec, _store_vec, row_copy_chunks
 
 KERNEL_NAME = "softmax_bwd_kernel"
 
@@ -54,6 +54,10 @@ WARP_SIZE = get_warp_size()
 MAX_RESIDENT_ELEMS_PER_THREAD = 64
 MAX_RESIDENT_COLS = BLOCK_THREADS * MAX_RESIDENT_ELEMS_PER_THREAD
 
+# Below four elements per thread, the scalar dot product uses more active lanes.
+# On gfx1200, vectorizing short BF16 rows regresses latency by up to 36%.
+MIN_VECTOR_COLS = 4 * BLOCK_THREADS
+
 
 def softmax_bwd_buffered_operands(N: int, dtype_str: str) -> int:
     """How many of (DY, Y) stay register-resident across the block reduction.
@@ -64,9 +68,7 @@ def softmax_bwd_buffered_operands(N: int, dtype_str: str) -> int:
     Exposed so the dispatch thresholds can be asserted without a GPU, mirroring
     ``is_rmsnorm_bwd_two_stage_vec_config`` in ``rmsnorm_bwd_kernel.py``.
     """
-    vec_width = 128 // (32 if dtype_str == "f32" else 16)
-    tile_cols = BLOCK_THREADS * vec_width
-    if N < tile_cols or N % tile_cols != 0:
+    if N < MIN_VECTOR_COLS:
         return 0
     if N <= MAX_RESIDENT_COLS:
         return 2
@@ -80,8 +82,8 @@ def build_softmax_bwd_module(N: int, dtype_str: str = "f32"):
     # BufferCopy128b moves one 128-bit transaction per lane, so the register
     # vector width must satisfy vec_width * elem_bits == 128 (8 for 16-bit, 4 for f32).
     vec_width = 128 // elem_bits
-    tile_cols = BLOCK_THREADS * vec_width
 
+    copy_chunks = row_copy_chunks(N, BLOCK_THREADS, vec_width)
     BlockReduce = fx.coop.BlockReduce[fx.Float32, BLOCK_THREADS]
     SharedStorage = BlockReduce.SharedStorage
 
@@ -116,58 +118,48 @@ def build_softmax_bwd_module(N: int, dtype_str: str = "f32"):
         row_dx = fx.slice(DX_buf, (bid, None))
 
         # ==================================================================
-        # Fast path: N is a multiple of tile_cols
+        # Vector prefix with an optional scalar tail
         # ==================================================================
-        if const_expr(N >= tile_cols and N % tile_cols == 0):
-            num_tiles = N // tile_cols
-            # Three tiers by row width. Ideal traffic is 3 units (read Y, read
-            # DY, write DX); each operand dropped from registers adds one more.
-            #   both buffered  -> 3 units
-            #   Y only         -> 4 units (DY re-read)
-            #   neither        -> 5 units
-            # Y alone at twice the cap costs the same registers as both operands
-            # at the cap, so the middle tier is free in occupancy terms.
+        if const_expr(N >= MIN_VECTOR_COLS):
+            # Retain both operands, only Y, or neither as row width grows.
             buffer_dy = N <= MAX_RESIDENT_COLS
             buffer_y = N <= 2 * MAX_RESIDENT_COLS
-
-            # 1. Load both operands, accumulate the row dot product in fp32.
-            #    Buffered in native dtype; widened only for the arithmetic.
             dy_buffer = []
             y_buffer = []
             thread_dot = c_zero_f
 
-            for tile_i in range_constexpr(num_tiles):
-                idx = tid + tile_i * BLOCK_THREADS
-                dy_vec = _load_vec(row_dy, idx, vec_width, dtype_str)
-                y_vec = _load_vec(row_y, idx, vec_width, dtype_str)
+            # 1. Apply validity after the local dot, avoiding elementwise input masks.
+            for i in range_constexpr(len(copy_chunks)):
+                width, base, limit = copy_chunks[i]
+                idx = tid + base
+                dy_vec = _load_vec(row_dy, idx, width, dtype_str, mask=idx < limit)
+                y_vec = _load_vec(row_y, idx, width, dtype_str, mask=idx < limit)
                 if const_expr(buffer_dy):
                     dy_buffer.append(dy_vec)
                 if const_expr(buffer_y):
                     y_buffer.append(y_vec)
                 prod = dy_vec.to(fx.Float32) * y_vec.to(fx.Float32)
-                thread_dot = thread_dot + prod.reduce(ReductionOp.ADD, fastmath=fm_fast)
-
+                thread_dot = thread_dot + (idx < limit).select(prod.reduce(ReductionOp.ADD, fastmath=fm_fast), c_zero_f)
             dot = block_reduce_add(thread_dot)
 
-            # 2. Apply dx = y * (dy - dot)
-            for tile_i in range_constexpr(num_tiles):
-                idx = tid + tile_i * BLOCK_THREADS
+            # 2. Apply dx = y * (dy - dot), reloading unbuffered inputs.
+            for i in range_constexpr(len(copy_chunks)):
+                width, base, limit = copy_chunks[i]
+                idx = tid + base
                 if const_expr(buffer_dy):
-                    dy_f = dy_buffer[tile_i].to(fx.Float32)
+                    dy_vec = dy_buffer[i]
                 else:
-                    dy_f = _load_vec(row_dy, idx, vec_width, dtype_str).to(fx.Float32)
+                    dy_vec = _load_vec(row_dy, idx, width, dtype_str, mask=idx < limit)
                 if const_expr(buffer_y):
-                    y_f = y_buffer[tile_i].to(fx.Float32)
+                    y_vec = y_buffer[i]
                 else:
-                    y_f = _load_vec(row_y, idx, vec_width, dtype_str).to(fx.Float32)
-
-                dx_vec = y_f * (dy_f - dot)
-                out_e = dx_vec if dtype_str == "f32" else dx_vec.to(elem_dtype)
-                _store_vec(row_dx, idx, out_e, vec_width, dtype_str)
+                    y_vec = _load_vec(row_y, idx, width, dtype_str, mask=idx < limit)
+                dx_vec = y_vec.to(fx.Float32) * (dy_vec.to(fx.Float32) - dot)
+                _store_vec(row_dx, idx, dx_vec, width, dtype_str, mask=idx < limit)
 
         else:
             # ==============================================================
-            # Generic path: scalar for arbitrary N
+            # Small-row path: masked scalar access
             # ==============================================================
             copy_atom_s = fx.make_copy_atom(
                 fx.rocdl.BufferCopy16b() if elem_bits <= 16 else fx.rocdl.BufferCopy32b(),

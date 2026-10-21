@@ -6,9 +6,9 @@
 """Softmax backward correctness and performance tests.
 
 Covers dx = y * (dy - sum(dy * y)) across:
-  - the vectorized path (N % tile_cols == 0) at all three residency tiers
+  - the vectorized path with partial tiles and tails at all three residency tiers
     (both operands buffered, Y only, neither);
-  - the generic masked scalar path (arbitrary N, including N < BLOCK_THREADS);
+  - the masked scalar path for short rows;
   - f32 / f16 / bf16.
 """
 
@@ -245,9 +245,14 @@ def test_register_buffering_threshold():
     assert softmax_bwd_buffered_operands(32768, "bf16") == 1
     # Neither -- 5 units.
     assert softmax_bwd_buffered_operands(65536, "bf16") == 0
-    # Not on the vectorized path at all.
-    assert softmax_bwd_buffered_operands(2000, "f32") == 0  # not a multiple
-    assert softmax_bwd_buffered_operands(512, "bf16") == 0  # below tile_cols
+    # Partial tiles use the same residency policy.
+    assert softmax_bwd_buffered_operands(2000, "f32") == 2
+    assert softmax_bwd_buffered_operands(512, "bf16") == 0
+    assert softmax_bwd_buffered_operands(16385, "bf16") == 1
+    assert softmax_bwd_buffered_operands(32769, "bf16") == 0
+    # Short rows retain the scalar path.
+    assert softmax_bwd_buffered_operands(3, "f32") == 0
+    assert softmax_bwd_buffered_operands(7, "bf16") == 0
 
 
 @pytest.mark.large_shape
